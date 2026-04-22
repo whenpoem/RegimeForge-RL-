@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from backend.regime_lens.config import AgentType, TrainingConfig
+from backend.regime_lens.config import AgentType, GateType, TrainingConfig
 from backend.regime_lens.dqn import DQNAgent, PrioritizedReplayBuffer
 from backend.regime_lens.hmm_dqn import HMMDQNAgent
 from backend.regime_lens.rcmoe import RCMoEAgent
@@ -15,6 +15,35 @@ from backend.regime_lens.training import TrainingManager, _create_agent
 
 
 class CheckpointRestoreTests(unittest.TestCase):
+    def _train_temporal_rcmoe_source_run(self, artifact_root: Path) -> tuple[TrainingManager, str]:
+        config = TrainingConfig(
+            artifact_root=artifact_root,
+            agent_type=AgentType.RCMOE_DQN,
+            gate_type=GateType.TEMPORAL,
+            context_len=3,
+            seed=11,
+            episodes=1,
+            episode_length=12,
+            warmup_steps=6,
+            checkpoint_interval=1,
+            metrics_flush_interval=1,
+            evaluation_episodes=1,
+            train_after_steps=0,
+            update_every_steps=1,
+            gradient_steps=1,
+            batch_size=4,
+            replay_capacity=32,
+            hidden_dim=24,
+            gate_hidden_dim=16,
+            n_experts=3,
+            device="cpu",
+            autostart=False,
+        )
+        manager = TrainingManager(config)
+        run_id, _ = manager.store.create_run(manager._config_payload())
+        manager._train_loop(run_id)
+        return manager, run_id
+
     def test_training_writes_explainability_artifact_for_rcmoe_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_root = Path(tmp)
@@ -228,6 +257,54 @@ class CheckpointRestoreTests(unittest.TestCase):
                         torch.testing.assert_close(value, restored_value)
                     else:
                         self.assertEqual(value, restored_value)
+
+    def test_resume_uses_checkpoint_config_when_current_request_uses_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            source_manager, source_run = self._train_temporal_rcmoe_source_run(artifact_root)
+
+            resume_config = TrainingConfig(
+                artifact_root=artifact_root,
+                resume_run_id=source_run,
+                episodes=2,
+                device="cpu",
+                autostart=False,
+            )
+            resume_manager = TrainingManager(resume_config)
+            resumed_run, _ = resume_manager.store.create_run(resume_manager._config_payload())
+
+            resume_manager._train_loop(resumed_run)
+
+            source_summary = source_manager.store.read_run_summary(source_run)
+            resumed_summary = resume_manager.store.read_run_summary(resumed_run)
+            resumed_snapshot = resumed_summary["config"]
+
+            self.assertEqual(resumed_summary["currentEpisode"], 2)
+            self.assertEqual(resumed_summary["resumedFromRunId"], source_run)
+            self.assertEqual(resumed_snapshot["agent_type"], source_summary["config"]["agent_type"])
+            self.assertEqual(resumed_snapshot["gate_type"], source_summary["config"]["gate_type"])
+            self.assertEqual(resumed_snapshot["context_len"], source_summary["config"]["context_len"])
+            self.assertEqual(resumed_snapshot["episodes"], 2)
+
+    def test_resume_rejects_explicit_incompatible_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_root = Path(tmp)
+            _, source_run = self._train_temporal_rcmoe_source_run(artifact_root)
+
+            resume_config = TrainingConfig(
+                artifact_root=artifact_root,
+                resume_run_id=source_run,
+                resume_checkpoint_id="ckpt-0001",
+                episodes=2,
+                agent_type=AgentType.HMM_DQN,
+                device="cpu",
+                autostart=False,
+            )
+            resume_manager = TrainingManager(resume_config)
+            resumed_run, _ = resume_manager.store.create_run(resume_manager._config_payload())
+
+            with self.assertRaisesRegex(ValueError, "agent_type"):
+                resume_manager._train_loop(resumed_run)
 
 
 if __name__ == "__main__":

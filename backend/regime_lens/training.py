@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime
 import platform
+from pathlib import Path
 import threading
 import time
 import traceback
@@ -498,7 +499,8 @@ class TrainingManager:
         checkpoint_id: str,
         run_id: str | None = None,
         weights_only: bool = True,
-    ) -> DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent:
+        agent_config: TrainingConfig | None = None,
+    ) -> DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent | ContinuousActorCriticAgent:
         """Load a trained agent from a saved checkpoint.
 
         Args:
@@ -522,33 +524,143 @@ class TrainingManager:
             raise FileNotFoundError(
                 f"No model weights found for checkpoint {checkpoint_id} in run {resolved}"
             )
-        run_summary = self.store.read_run_summary(resolved)
-        snapshot = run_summary.get("config")
-        if not isinstance(snapshot, dict):
-            raise ValueError(f"Run {resolved} is missing its saved configuration snapshot.")
-        saved_config = config_from_snapshot(snapshot)
-        agent_config = replace(
+        saved_config = self._checkpoint_saved_config(resolved, checkpoint_id)
+        effective_config = agent_config or replace(
             saved_config,
             device=self.config.device,
             cpu_threads=self.config.cpu_threads,
             process_priority=self.config.process_priority,
         )
         runtime = configure_runtime(
-            agent_config.device,
-            agent_config.cpu_threads,
-            agent_config.process_priority,
+            effective_config.device,
+            effective_config.cpu_threads,
+            effective_config.process_priority,
         )
-        env = _build_env(agent_config)
+        _, agent = self._build_env_and_agent(effective_config, runtime.resolved_device)
+        weights_dir = self.store.model_weights_dir(resolved, checkpoint_id)
+        agent.load_checkpoint(weights_dir, weights_only=weights_only)
+        return agent
+
+    def _build_env_and_agent(
+        self,
+        config: TrainingConfig,
+        resolved_device: str,
+    ) -> tuple[Any, DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent | ContinuousActorCriticAgent]:
+        env = _build_env(config)
         agent_kwargs: dict[str, int] = {}
-        if _is_continuous_config(agent_config):
+        if _is_continuous_config(config):
             agent_kwargs = {
                 "observation_dim": int(getattr(env, "observation_dim")),
                 "action_dim": int(getattr(env, "action_dim")),
             }
-        agent = _create_agent(agent_config, runtime.resolved_device, **agent_kwargs)
-        weights_dir = self.store.model_weights_dir(resolved, checkpoint_id)
-        agent.load_checkpoint(weights_dir, weights_only=weights_only)
-        return agent
+        agent = _create_agent(config, resolved_device, **agent_kwargs)
+        return env, agent
+
+    def _resolve_checkpoint_id(self, artifact_root: Any, run_id: str, checkpoint_id: str | None) -> str:
+        if checkpoint_id is not None:
+            return checkpoint_id
+        source_index = self.store.read_json(Path(artifact_root) / run_id / "checkpoints" / "index.json")
+        checkpoints = source_index.get("checkpoints", [])
+        if not checkpoints:
+            raise ValueError(f"Run {run_id} does not contain any checkpoints to resume from.")
+        return str(checkpoints[-1]["checkpointId"])
+
+    def _checkpoint_saved_config(self, run_id: str, checkpoint_id: str) -> TrainingConfig:
+        resume_state = self.store.checkpoint_resume_state(run_id, checkpoint_id) or {}
+        snapshot = resume_state.get("config")
+        if not isinstance(snapshot, dict):
+            run_summary = self.store.read_run_summary(run_id)
+            snapshot = run_summary.get("config")
+        if not isinstance(snapshot, dict):
+            raise ValueError(f"Run {run_id} is missing its saved configuration snapshot.")
+        return config_from_snapshot(snapshot)
+
+    def _merge_resume_config(
+        self,
+        saved_config: TrainingConfig,
+        current_config: TrainingConfig,
+        *,
+        resolved_checkpoint_id: str,
+    ) -> TrainingConfig:
+        default_snapshot = config_to_snapshot(TrainingConfig())
+        saved_snapshot = config_to_snapshot(saved_config)
+        current_snapshot = config_to_snapshot(current_config)
+        always_override_fields = {
+            "artifact_root",
+            "autostart",
+            "checkpoint_version",
+            "config_path",
+            "cpu_threads",
+            "device",
+            "process_priority",
+            "resume_checkpoint_id",
+            "resume_run_id",
+        }
+        safe_explicit_override_fields = {
+            "checkpoint_interval",
+            "episodes",
+            "evaluation_episodes",
+            "experiment_name",
+            "fixed_eval_seeds",
+            "metrics_flush_interval",
+            "parallel_workers",
+            "policy_grid_size",
+            "tracking_backend",
+        }
+
+        incompatible_overrides: list[str] = []
+        for field_name, current_value in current_snapshot.items():
+            if field_name in always_override_fields or field_name in safe_explicit_override_fields:
+                continue
+            if field_name not in default_snapshot:
+                continue
+            if current_value == default_snapshot[field_name] or current_value == saved_snapshot.get(field_name):
+                continue
+            incompatible_overrides.append(field_name)
+
+        if incompatible_overrides:
+            incompatible_fields = ", ".join(sorted(incompatible_overrides))
+            raise ValueError(
+                "Resume configuration overrides incompatible checkpoint settings: "
+                f"{incompatible_fields}. "
+                "Create a fresh run or resume without changing training/environment-shaping fields."
+            )
+
+        merged_snapshot = dict(saved_snapshot)
+        for field_name in always_override_fields:
+            merged_snapshot[field_name] = current_snapshot[field_name]
+        for field_name in safe_explicit_override_fields:
+            if current_snapshot[field_name] != default_snapshot[field_name]:
+                merged_snapshot[field_name] = current_snapshot[field_name]
+        merged_snapshot["resume_checkpoint_id"] = resolved_checkpoint_id
+        return config_from_snapshot(merged_snapshot)
+
+    def _build_resume_context(
+        self,
+        config: TrainingConfig,
+    ) -> tuple[TrainingConfig, dict[str, Any] | None, dict[str, Any], str, str]:
+        if config.resume_run_id is None:
+            raise ValueError("Resume context requested without a resume_run_id.")
+
+        source_run = config.resume_run_id
+        source_checkpoint = self._resolve_checkpoint_id(
+            config.artifact_root,
+            source_run,
+            config.resume_checkpoint_id,
+        )
+        resume_state = self.store.checkpoint_resume_state(source_run, source_checkpoint) or {}
+        saved_config = self._checkpoint_saved_config(source_run, source_checkpoint)
+        merged_config = self._merge_resume_config(
+            saved_config,
+            config,
+            resolved_checkpoint_id=source_checkpoint,
+        )
+        data_fit = self.store.checkpoint_data_fit(source_run, source_checkpoint)
+        if data_fit is None:
+            run_data_fit = Path(config.artifact_root) / source_run / "data_fit.json"
+            if run_data_fit.exists():
+                data_fit = self.store.read_json(run_data_fit)
+        return merged_config, data_fit, resume_state, source_run, source_checkpoint
 
     def _config_payload(self) -> dict[str, Any]:
         return config_to_snapshot(self.config)
@@ -609,527 +721,6 @@ class TrainingManager:
         finally:
             self._process_lock = None
 
-    # -----------------------------------------------------------------------
-    # Main training loop
-    # -----------------------------------------------------------------------
-
-    def _train_loop(self, run_id: str) -> None:
-        config, data_fit = inject_fitted_regime_data(self.config)
-        runtime = configure_runtime(config.device, config.cpu_threads, config.process_priority)
-        run_dir = config.artifact_root / run_id
-        tracker = create_tracker(config, run_dir)
-        self.store.update_run_summary(
-            run_id,
-            {
-                "runtime": runtime.to_payload(),
-                "agentType": config.agent_type.value,
-                "config": config_to_snapshot(config),
-                "tracking": tracker.status_payload(),
-            },
-        )
-        if data_fit is not None:
-            self.store.write_run_file(run_id, "data_fit.json", data_fit)
-        env = SyntheticMarketEnv(config)
-        agent = _create_agent(config, runtime.resolved_device)
-
-        metrics_series: list[dict[str, Any]] = []
-        checkpoint_summaries: list[dict[str, Any]] = []
-        global_step = 0
-        start_episode = 1
-        elapsed_offset = 0.0
-        if config.resume_run_id is not None:
-            source_run = config.resume_run_id
-            source_checkpoint = config.resume_checkpoint_id
-            if source_checkpoint is None:
-                source_index = self.store.read_json(config.artifact_root / source_run / "checkpoints" / "index.json")
-                checkpoints = source_index.get("checkpoints", [])
-                if not checkpoints:
-                    raise ValueError(f"Run {source_run} does not contain any checkpoints to resume from.")
-                source_checkpoint = str(checkpoints[-1]["checkpointId"])
-            agent = self.load_agent_from_checkpoint(source_checkpoint, run_id=source_run, weights_only=False)
-            resume_state = self.store.checkpoint_resume_state(source_run, source_checkpoint) or {}
-            start_episode = int(resume_state.get("episode", 0)) + 1
-            global_step = int(resume_state.get("globalStep", 0))
-            elapsed_offset = float(resume_state.get("elapsedSeconds", 0.0))
-            self.store.update_run_summary(
-                run_id,
-                {
-                    "resumedFromRunId": source_run,
-                    "resumedFromCheckpointId": source_checkpoint,
-                },
-            )
-        started_at = time.perf_counter() - elapsed_offset
-
-        try:
-            for episode in range(start_episode, config.episodes + 1):
-                epsilon = config.epsilon_for_episode(episode)
-                state = env.reset(seed=config.seed + episode)
-                done = False
-                episode_reward = 0.0
-                market_return = (env.prices[env.end_index] / env.prices[config.warmup_steps]) - 1.0
-                loss_values: list[float] = []
-                actions = Counter()
-                gross_return = 0.0
-                step_pnls: list[float] = []
-                step_regimes: list[str] = []
-                context_history = initialise_context_history(state, context_len=max(config.context_len, 1))
-
-                # HMM: fit detector on warm-up returns each episode
-                if _is_hmm(agent):
-                    agent.fit_detector(env.returns[:config.warmup_steps])
-
-                while not done:
-                    self._resume_event.wait()
-                    # Build observation based on agent type
-                    if _is_oracle(agent):
-                        oracle_view = env.observe_oracle()
-                        obs_state = oracle_view.state
-                    elif _is_hmm(agent):
-                        base_view = env.observe()
-                        recent_ret = env.returns[max(0, env.t - 10) : env.t]
-                        obs_state = agent.augment_state(base_view.state, recent_ret)
-                    elif _uses_temporal_gate(config, agent):
-                        obs_state = build_temporal_context(context_history, context_len=max(config.context_len, 1))
-                    else:
-                        obs_state = state
-
-                    action = agent.select_action(obs_state, epsilon)
-                    next_state, reward, done, info = env.step(action)
-                    actions[ACTION_LABELS[action]] += 1
-                    next_context_history = append_context_state(context_history, next_state)
-
-                    # Build next observation for storage
-                    if _is_oracle(agent):
-                        next_oracle = env.observe_oracle()
-                        next_obs = next_oracle.state
-                    elif _is_hmm(agent):
-                        next_base = env.observe()
-                        next_recent = env.returns[max(0, env.t - 10) : env.t]
-                        next_obs = agent.augment_state(next_base.state, next_recent)
-                    elif _uses_temporal_gate(config, agent):
-                        next_obs = build_temporal_context(next_context_history, context_len=max(config.context_len, 1))
-                    else:
-                        next_obs = next_state
-
-                agent.store(obs_state, action, reward, next_obs, done)
-                global_step += 1
-                if global_step >= config.train_after_steps and global_step % config.update_every_steps == 0:
-                    # Anneal PER beta from beta_start → 1.0 over training
-                    per_beta = min(
-                        1.0,
-                        config.per_beta_start + (1.0 - config.per_beta_start) * (episode / max(config.episodes, 1)),
-                    )
-                    for _ in range(config.gradient_steps):
-                        loss = agent.update(per_beta=per_beta)
-                        if loss is not None:
-                            loss_values.append(loss)
-                episode_reward += reward
-                pnl_net = float(info["pnl"]) - float(info["transaction_cost"])
-                gross_return += pnl_net
-                step_pnls.append(pnl_net)
-                step_regimes.append(str(info["regime"]))
-
-                # Update live telemetry for TUI
-                with self._lock:
-                    self._live_regime = str(info["regime"])
-                    self._live_regime_index = int(info["regime_index"])
-                    if _is_rcmoe(agent) and agent.last_gate_weights is not None:
-                        gw = agent.last_gate_weights
-                        self._live_gate_weights = gw.copy()
-                        dominant = int(np.argmax(gw))
-                        self._live_gate_accuracy_window.append(dominant == self._live_regime_index)
-                        if len(self._live_gate_accuracy_window) > 500:
-                            self._live_gate_accuracy_window = self._live_gate_accuracy_window[-500:]
-                        self._live_expert_history.append({
-                            "weights": gw.tolist(),
-                            "regime": self._live_regime,
-                            "regime_index": self._live_regime_index,
-                        })
-                        if len(self._live_expert_history) > 500:
-                            self._live_expert_history = self._live_expert_history[-500:]
-
-                state = next_state
-                context_history = next_context_history
-
-                # Compute episode-level financial metrics
-                fin_metrics = episode_metrics(
-                    np.asarray(step_pnls), step_regimes, REGIME_LABELS,
-                )
-                with self._lock:
-                    self._live_financial_metrics = {
-                        k: v for k, v in fin_metrics.items() if isinstance(v, (int, float))
-                    }
-
-                metric_entry: dict[str, Any] = {
-                    "episode": episode,
-                    "globalStep": global_step,
-                    "epsilon": epsilon,
-                    "totalReward": episode_reward,
-                    "strategyReturn": gross_return,
-                    "marketReturn": market_return,
-                    "avgLoss": float(np.mean(loss_values)) if loss_values else None,
-                    "actionMix": {label: int(actions[label]) for label in ACTION_LABELS},
-                    "sharpe": fin_metrics.get("sharpe"),
-                    "sortino": fin_metrics.get("sortino"),
-                    "maxDrawdown": fin_metrics.get("max_drawdown"),
-                    "winRate": fin_metrics.get("win_rate"),
-                }
-                if _is_rcmoe(agent):
-                    metric_entry["gateAccuracy"] = self.live_gate_accuracy
-                metrics_series.append(metric_entry)
-                tracker.log_episode(episode, metric_entry)
-
-                self.store.update_run_summary(
-                    run_id,
-                    {
-                        "currentEpisode": episode,
-                        "latestCheckpointId": checkpoint_summaries[-1]["checkpointId"] if checkpoint_summaries else None,
-                        "episodeLength": config.episode_length,
-                        "featureNames": FEATURE_NAMES,
-                        "actionLabels": ACTION_LABELS,
-                        "regimeLabels": REGIME_LABELS,
-                        "episodesPlanned": config.episodes,
-                        "globalStep": global_step,
-                        "elapsedSeconds": time.perf_counter() - started_at,
-                        "agentType": config.agent_type.value,
-                    },
-                )
-
-                if episode % config.metrics_flush_interval == 0 or episode == config.episodes:
-                    self.store.write_metrics(run_id, metrics_series)
-
-                if episode % config.checkpoint_interval == 0 or episode == config.episodes:
-                    checkpoint_payload = self._evaluate_checkpoint(
-                        agent,
-                        env,
-                        episode,
-                        global_step=global_step,
-                        elapsed_seconds=time.perf_counter() - started_at,
-                        data_fit=data_fit,
-                        repro=self._build_repro_bundle(config, runtime, tracker),
-                    )
-                    checkpoint_summaries.append(checkpoint_payload["summary"])
-                    ckpt_id = checkpoint_payload["summary"]["checkpointId"]
-                    self.store.write_checkpoint(run_id, ckpt_id, checkpoint_payload)
-                    # Persist model weights alongside analysis artifacts
-                    weights_dir = self.store.model_weights_dir(run_id, ckpt_id)
-                    agent.save_checkpoint(weights_dir)
-                    tracker.log_checkpoint(episode, checkpoint_payload["summary"])
-                    self.store.write_checkpoint_index(run_id, checkpoint_summaries)
-                    self.store.update_run_summary(
-                        run_id,
-                        {
-                            "checkpoints": [item["checkpointId"] for item in checkpoint_summaries],
-                            "latestCheckpointId": ckpt_id,
-                        },
-                    )
-
-            self.store.write_metrics(run_id, metrics_series)
-            self.store.update_run_summary(
-                run_id,
-                {
-                    "status": "completed",
-                    "completedAt": datetime.now(tz=UTC).isoformat(),
-                    "currentEpisode": config.episodes,
-                    "globalStep": global_step,
-                    "elapsedSeconds": time.perf_counter() - started_at,
-                },
-            )
-        finally:
-            tracker.close()
-
-    # -----------------------------------------------------------------------
-    # Evaluation + checkpoint construction
-    # -----------------------------------------------------------------------
-
-    def _evaluate_checkpoint(
-        self,
-        agent: DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent,
-        env: SyntheticMarketEnv,
-        episode: int,
-        *,
-        global_step: int,
-        elapsed_seconds: float,
-        data_fit: dict[str, Any] | None,
-        repro: dict[str, Any],
-    ) -> dict[str, Any]:
-        eval_rewards: list[float] = []
-        eval_returns: list[float] = []
-        random_returns: list[float] = []
-        long_returns: list[float] = []
-        representative_episode: dict[str, Any] | None = None
-
-        for eval_index, seed in enumerate(self.config.fixed_eval_seeds[: self.config.evaluation_episodes]):
-            trace = self._rollout(
-                agent,
-                policy=lambda state, _step: agent.greedy_action(state),
-                seed=seed,
-                include_trace=eval_index == 0,
-            )
-            eval_rewards.append(trace["summary"]["cumulativeReward"])
-            eval_returns.append(trace["summary"]["strategyReturn"])
-            if eval_index == 0:
-                representative_episode = trace
-
-            random_trace = self._rollout(
-                agent,
-                policy=lambda _state, _step, rng=np.random.default_rng(seed + 31): int(rng.integers(0, len(ACTION_VALUES))),
-                seed=seed,
-                include_trace=False,
-            )
-            buy_hold_trace = self._rollout(
-                agent,
-                policy=lambda _state, _step: 2,
-                seed=seed,
-                include_trace=False,
-            )
-            random_returns.append(random_trace["summary"]["strategyReturn"])
-            long_returns.append(buy_hold_trace["summary"]["strategyReturn"])
-
-        if representative_episode is None:
-            raise RuntimeError("Failed to build representative evaluation episode.")
-
-        checkpoint_id = f"ckpt-{episode:04d}"
-        embedding = self._build_embedding(representative_episode, checkpoint_id, episode)
-        representative_episode.pop("embeddingStates", None)
-
-        summary: dict[str, Any] = {
-            "checkpointId": checkpoint_id,
-            "episode": episode,
-            "capturedAt": datetime.now(tz=UTC).isoformat(),
-            "avgEvalReward": float(np.mean(eval_rewards)),
-            "agentReturn": float(np.mean(eval_returns)),
-            "randomReturn": float(np.mean(random_returns)),
-            "buyHoldReturn": float(np.mean(long_returns)),
-            "actionMix": representative_episode["summary"]["actionCounts"],
-        }
-
-        # Financial metrics for checkpoint
-        if representative_episode.get("financialMetrics"):
-            summary["financialMetrics"] = representative_episode["financialMetrics"]
-
-        # Regime analysis for RCMoE agent
-        regime_analysis: dict[str, Any] | None = None
-        expert_analysis: dict[str, Any] | None = None
-        if _is_rcmoe(agent) and representative_episode.get("gateWeights"):
-            gw = np.asarray(representative_episode["gateWeights"], dtype=np.float64)
-            regimes = representative_episode.get("stepRegimes", [])
-            hidden = None
-            if representative_episode.get("embeddingStates"):
-                hidden = np.asarray(representative_episode["embeddingStates"], dtype=np.float64)
-            regime_analysis = full_regime_analysis(gw, regimes, REGIME_LABELS, hidden)
-            summary["nmi"] = regime_analysis["nmi"]
-            summary["ari"] = regime_analysis["ari"]
-            summary["gateEntropy"] = regime_analysis["gate_entropy"]
-            summary["specialisationScore"] = regime_analysis.get("specialisation_score", 0.0)
-            summary["expertUtilization"] = regime_analysis["expert_utilization"]
-            expert_analysis = {
-                "activation_matrix": regime_analysis["activation_matrix"],
-                "expert_utilization": regime_analysis["expert_utilization"],
-                "specialisation_score": regime_analysis.get("specialisation_score", 0.0),
-                "gate_entropy_per_regime": regime_analysis.get("gate_entropy_per_regime", {}),
-            }
-
-        representative_episode["checkpointId"] = checkpoint_id
-        representative_episode["episode"] = episode
-        # Remove large arrays before serialisation
-        representative_episode.pop("gateWeights", None)
-        representative_episode.pop("stepRegimes", None)
-
-        result: dict[str, Any] = {
-            "summary": summary,
-            "episode": representative_episode,
-            "policy": self._build_policy_surface(agent, checkpoint_id, episode),
-            "embedding": embedding,
-            "resume_state": {
-                "episode": episode,
-                "globalStep": global_step,
-                "elapsedSeconds": elapsed_seconds,
-                "checkpointVersion": self.config.checkpoint_version,
-                "config": config_to_snapshot(self.config),
-            },
-            "repro": repro,
-        }
-        if data_fit is not None:
-            result["data_fit"] = data_fit
-        if regime_analysis is not None:
-            result["regime_analysis"] = regime_analysis
-        if expert_analysis is not None:
-            result["expert_analysis"] = expert_analysis
-        return result
-
-    def _rollout(
-        self,
-        agent: DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent,
-        policy: Callable[[np.ndarray, int], int],
-        seed: int,
-        include_trace: bool,
-    ) -> dict[str, Any]:
-        env = SyntheticMarketEnv(self.config)
-        env.reset(seed=seed)
-
-        # HMM: fit on warm-up
-        if _is_hmm(agent):
-            agent.fit_detector(env.returns[:self.config.warmup_steps])
-
-        done = False
-        step = 0
-        cumulative_reward = 0.0
-        strategy_return = 0.0
-        action_counter = Counter()
-        regime_counter = Counter()
-        trace_steps: list[dict[str, Any]] = []
-        states_for_embedding: list[np.ndarray] = []
-        gate_weights_list: list[list[float]] = []
-        step_regimes: list[str] = []
-        step_pnls: list[float] = []
-        context_history = initialise_context_history(env.observe().state, context_len=max(self.config.context_len, 1))
-
-        while not done:
-            view = env.observe()
-
-            # Build agent-specific observation
-            if _is_oracle(agent):
-                oracle_view = env.observe_oracle()
-                agent_state = oracle_view.state
-            elif _is_hmm(agent):
-                recent_ret = env.returns[max(0, env.t - 10) : env.t]
-                agent_state = agent.augment_state(view.state, recent_ret)
-            elif _uses_temporal_gate(self.config, agent):
-                agent_state = build_temporal_context(context_history, context_len=max(self.config.context_len, 1))
-            else:
-                agent_state = view.state
-
-            q_values = agent.q_values(agent_state)
-            action = policy(agent_state, step)
-            _, reward, done, info = env.step(action)
-            context_history = append_context_state(context_history, env.observe().state)
-            action_label = ACTION_LABELS[action]
-            regime = str(info["regime"])
-            action_counter[action_label] += 1
-            regime_counter[regime] += 1
-            cumulative_reward += reward
-            pnl_net = float(info["pnl"]) - float(info["transaction_cost"])
-            strategy_return += pnl_net
-            step_pnls.append(pnl_net)
-            step_regimes.append(regime)
-            states_for_embedding.append(agent.hidden_activations(agent_state))
-
-            # Collect gate weights for RCMoE
-            if _is_rcmoe(agent):
-                gw = agent.gate_weights(agent_state)
-                gate_weights_list.append(gw.tolist())
-
-            if include_trace:
-                trace_entry: dict[str, Any] = {
-                    "step": step,
-                    "price": float(info["price"]),
-                    "nextPrice": float(info["next_price"]),
-                    "regime": regime,
-                    "action": action_label,
-                    "position": int(info["position"]),
-                    "reward": float(reward),
-                    "pnl": float(info["pnl"]),
-                    "transactionCost": float(info["transaction_cost"]),
-                    "holdPenalty": float(info["hold_penalty"]),
-                    "qValues": {
-                        ACTION_LABELS[index]: float(value)
-                        for index, value in enumerate(q_values.tolist())
-                    },
-                    "featureMap": {key: float(value) for key, value in view.feature_map.items()},
-                    "stateVector": [float(value) for value in view.state.tolist()],
-                }
-                if _is_rcmoe(agent) and gate_weights_list:
-                    trace_entry["gateWeights"] = gate_weights_list[-1]
-                trace_steps.append(trace_entry)
-            step += 1
-
-        fin = episode_metrics(np.asarray(step_pnls), step_regimes, REGIME_LABELS)
-
-        summary = {
-            "cumulativeReward": float(cumulative_reward),
-            "strategyReturn": float(strategy_return),
-            "marketReturn": float((env.prices[env.end_index] / env.prices[self.config.warmup_steps]) - 1.0),
-            "actionCounts": {label: int(action_counter[label]) for label in ACTION_LABELS},
-            "regimeExposure": {label: int(regime_counter[label]) for label in REGIME_LABELS},
-        }
-
-        payload: dict[str, Any] = {
-            "summary": summary,
-            "financialMetrics": fin,
-        }
-        if include_trace:
-            payload["trace"] = trace_steps
-            payload["embeddingStates"] = [state.tolist() for state in states_for_embedding]
-        if gate_weights_list:
-            payload["gateWeights"] = gate_weights_list
-            payload["stepRegimes"] = step_regimes
-        return payload
-
-    def _build_policy_surface(self, agent: DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent,
-                               checkpoint_id: str, episode: int) -> dict[str, Any]:
-        env = SyntheticMarketEnv(self.config)
-        trend_axis = np.linspace(-2.6, 2.6, self.config.policy_grid_size)
-        vol_axis = np.linspace(0.2, 3.2, self.config.policy_grid_size)
-        states = np.asarray(
-            [
-                env.baseline_state(trend_gap_pct=float(trend), volatility_pct=float(volatility))
-                for volatility in vol_axis
-                for trend in trend_axis
-            ],
-            dtype=np.float32,
-        )
-
-        # For oracle/HMM agents we need to augment states
-        if _is_oracle(agent):
-            # Use neutral regime (uniform) for policy surface
-            n_reg = len(REGIME_LABELS)
-            uniform = np.full(n_reg, 1.0 / n_reg, dtype=np.float32)
-            states = np.asarray([
-                np.concatenate([s, uniform]) for s in states
-            ], dtype=np.float32)
-        elif _is_hmm(agent):
-            n_comp = agent._n_components
-            uniform = np.full(n_comp, 1.0 / n_comp, dtype=np.float32)
-            states = np.asarray([
-                np.concatenate([s, uniform]) for s in states
-            ], dtype=np.float32)
-        elif _uses_temporal_gate(self.config, agent):
-            states = np.asarray([
-                np.tile(state, max(self.config.context_len, 1))
-                for state in states
-            ], dtype=np.float32)
-
-        q_matrix = agent.batch_q_values(states)
-        cells: list[dict[str, Any]] = []
-        q_index = 0
-        for volatility in vol_axis:
-            for trend in trend_axis:
-                q_values = q_matrix[q_index]
-                best_index = int(np.argmax(q_values))
-                cell: dict[str, Any] = {
-                    "trendGapPct": float(trend),
-                    "volatilityPct": float(volatility),
-                    "bestAction": ACTION_LABELS[best_index],
-                    "qValues": {
-                        ACTION_LABELS[index]: float(value)
-                        for index, value in enumerate(q_values.tolist())
-                    },
-                }
-                # Add gate weights for RCMoE policy surface
-                if _is_rcmoe(agent):
-                    base_state = states[q_index]
-                    gw = agent.gate_weights(base_state)
-                    cell["gateWeights"] = gw.tolist()
-                cells.append(cell)
-                q_index += 1
-        return {
-            "checkpointId": checkpoint_id,
-            "episode": episode,
-            "axes": {"x": "trendGapPct", "y": "volatilityPct"},
-            "cells": cells,
-        }
-
     def _build_embedding(self, episode_payload: dict[str, Any], checkpoint_id: str, episode: int) -> dict[str, Any]:
         states = np.asarray(episode_payload["embeddingStates"], dtype=np.float64)
         if states.ndim == 1:
@@ -1176,7 +767,13 @@ class TrainingManager:
         }
 
     def _train_loop(self, run_id: str) -> None:
-        config, data_fit = inject_fitted_regime_data(self.config)
+        resume_state: dict[str, Any] = {}
+        source_run: str | None = None
+        source_checkpoint: str | None = None
+        if self.config.resume_run_id is not None:
+            config, data_fit, resume_state, source_run, source_checkpoint = self._build_resume_context(self.config)
+        else:
+            config, data_fit = inject_fitted_regime_data(self.config)
         runtime = configure_runtime(config.device, config.cpu_threads, config.process_priority)
         run_dir = config.artifact_root / run_id
         tracker = create_tracker(config, run_dir)
@@ -1198,28 +795,20 @@ class TrainingManager:
         if data_fit is not None:
             self.store.write_run_file(run_id, "data_fit.json", data_fit)
 
-        env = _build_env(config)
-        agent_kwargs: dict[str, int] = {}
-        if _is_continuous_config(config):
-            agent_kwargs = {
-                "observation_dim": int(getattr(env, "observation_dim")),
-                "action_dim": int(getattr(env, "action_dim")),
-            }
-        agent = _create_agent(config, runtime.resolved_device, **agent_kwargs)
-        if config.resume_run_id is not None:
-            source_run = config.resume_run_id
-            source_checkpoint = config.resume_checkpoint_id
-            if source_checkpoint is None:
-                source_index = self.store.read_json(config.artifact_root / source_run / "checkpoints" / "index.json")
-                checkpoints = source_index.get("checkpoints", [])
-                if not checkpoints:
-                    raise ValueError(f"Run {source_run} does not contain any checkpoints to resume from.")
-                source_checkpoint = str(checkpoints[-1]["checkpointId"])
-            agent = self.load_agent_from_checkpoint(source_checkpoint, run_id=source_run, weights_only=False)
-            resume_state = self.store.checkpoint_resume_state(source_run, source_checkpoint) or {}
+        env, agent = self._build_env_and_agent(config, runtime.resolved_device)
+        if source_run is not None and source_checkpoint is not None:
+            agent.load_checkpoint(
+                self.store.model_weights_dir(source_run, source_checkpoint),
+                weights_only=False,
+            )
             start_episode = int(resume_state.get("episode", 0)) + 1
             global_step = int(resume_state.get("globalStep", 0))
             elapsed_offset = float(resume_state.get("elapsedSeconds", 0.0))
+            if config.episodes < start_episode:
+                raise ValueError(
+                    f"Resume target episodes ({config.episodes}) must exceed the checkpoint episode "
+                    f"({start_episode - 1})."
+                )
             self.store.update_run_summary(
                 run_id,
                 {

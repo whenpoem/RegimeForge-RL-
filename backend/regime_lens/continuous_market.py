@@ -141,10 +141,11 @@ class _BaseContinuousMarketEnv:
         hold_penalty = self.config.position_penalty * np.abs(desired_position)
         slippage_cost = (self.config.slippage_bps / 10_000.0) * trade_size
 
-        flat_mask = np.isclose(desired_position, 0.0)
-        changed_mask = ~np.isclose(desired_position, previous_position)
-        self.entry_prices[flat_mask] = np.nan
-        self.entry_prices[changed_mask & ~flat_mask] = current_prices[changed_mask & ~flat_mask]
+        self.entry_prices = self._updated_entry_prices(
+            desired_position,
+            previous_position,
+            current_prices,
+        )
 
         self.positions = desired_position
         simple_return = (next_prices / current_prices) - 1.0
@@ -184,6 +185,44 @@ class _BaseContinuousMarketEnv:
                 f"Expected {self.num_assets} continuous action values, received shape {array.shape}."
             )
         return np.clip(array, self.action_space.low, self.action_space.high)
+
+    def _updated_entry_prices(
+        self,
+        desired_position: np.ndarray,
+        previous_position: np.ndarray,
+        current_prices: np.ndarray,
+    ) -> np.ndarray:
+        updated = self.entry_prices.copy()
+        tolerance = 1e-8
+
+        for asset_idx in range(self.num_assets):
+            target = float(desired_position[asset_idx])
+            previous = float(previous_position[asset_idx])
+            price = float(current_prices[asset_idx])
+            previous_entry = float(updated[asset_idx])
+
+            if np.isclose(target, 0.0, atol=tolerance):
+                updated[asset_idx] = np.nan
+                continue
+
+            if np.isclose(previous, 0.0, atol=tolerance) or np.sign(target) != np.sign(previous):
+                updated[asset_idx] = price
+                continue
+
+            if np.isnan(previous_entry):
+                updated[asset_idx] = price
+                continue
+
+            if abs(target) <= abs(previous) + tolerance:
+                updated[asset_idx] = previous_entry
+                continue
+
+            added_exposure = abs(target) - abs(previous)
+            updated[asset_idx] = (
+                (abs(previous) * previous_entry) + (added_exposure * price)
+            ) / abs(target)
+
+        return updated
 
     def _generate_regimes(self, steps: int) -> list[str]:
         regimes = [self.rng.choice(REGIME_LABELS, p=np.asarray([0.34, 0.18, 0.38, 0.10]))]
