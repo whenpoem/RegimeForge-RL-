@@ -52,36 +52,35 @@ class WebAppTests(unittest.TestCase):
                 (checkpoint_dir / name).write_text(json.dumps(payload), encoding="utf-8")
 
             locator = _encode_path_id("_experiments/suite/_worker_runs/method/seed-1/run-123")
-            client = TestClient(create_app(root))
+            with TestClient(create_app(root)) as client:
+                runs_json = client.get("/runs", headers={"accept": "application/json"})
+                self.assertEqual(runs_json.status_code, 200)
+                self.assertEqual(runs_json.json()[0]["pathId"], locator)
 
-            runs_json = client.get("/runs", headers={"accept": "application/json"})
-            self.assertEqual(runs_json.status_code, 200)
-            self.assertEqual(runs_json.json()[0]["pathId"], locator)
+                runs_html = client.get("/runs", headers={"accept": "text/html"})
+                self.assertEqual(runs_html.status_code, 200)
+                self.assertIn("Regime Lens Dashboard", runs_html.text)
 
-            runs_html = client.get("/runs", headers={"accept": "text/html"})
-            self.assertEqual(runs_html.status_code, 200)
-            self.assertIn("Regime Lens Dashboard", runs_html.text)
+                run_detail = client.get(f"/runs/{locator}", headers={"accept": "application/json"})
+                self.assertEqual(run_detail.status_code, 200)
+                self.assertEqual(run_detail.json()["summary"]["runId"], "run-123")
 
-            run_detail = client.get(f"/runs/{locator}", headers={"accept": "application/json"})
-            self.assertEqual(run_detail.status_code, 200)
-            self.assertEqual(run_detail.json()["summary"]["runId"], "run-123")
+                checkpoint_detail = client.get(
+                    f"/checkpoints/{locator}/ckpt-0001",
+                    headers={"accept": "application/json"},
+                )
+                self.assertEqual(checkpoint_detail.status_code, 200)
+                checkpoint_payload = checkpoint_detail.json()
+                self.assertIn("regime_analysis", checkpoint_payload)
+                self.assertIn("expert_analysis", checkpoint_payload)
+                self.assertIn("repro", checkpoint_payload)
+                self.assertEqual(checkpoint_payload["explainability"]["policyBoundary"]["target"], "policy")
 
-            checkpoint_detail = client.get(
-                f"/checkpoints/{locator}/ckpt-0001",
-                headers={"accept": "application/json"},
-            )
-            self.assertEqual(checkpoint_detail.status_code, 200)
-            checkpoint_payload = checkpoint_detail.json()
-            self.assertIn("regime_analysis", checkpoint_payload)
-            self.assertIn("expert_analysis", checkpoint_payload)
-            self.assertIn("repro", checkpoint_payload)
-            self.assertEqual(checkpoint_payload["explainability"]["policyBoundary"]["target"], "policy")
-
-            with client.websocket_connect(f"/live/{locator}") as websocket:
-                payload = websocket.receive_json()
-                self.assertEqual(payload["runId"], "run-123")
-                self.assertEqual(payload["checkpointCount"], 1)
-                self.assertEqual(payload["latestCheckpoint"]["checkpointId"], "ckpt-0001")
+                with client.websocket_connect(f"/live/{locator}") as websocket:
+                    payload = websocket.receive_json()
+                    self.assertEqual(payload["runId"], "run-123")
+                    self.assertEqual(payload["checkpointCount"], 1)
+                    self.assertEqual(payload["latestCheckpoint"]["checkpointId"], "ckpt-0001")
 
 
 if __name__ == "__main__":
