@@ -14,6 +14,8 @@ from typing import Any, Callable
 import numpy as np
 from scipy import stats  # type: ignore[import-untyped]
 
+from .stats_ext import bayesian_effect_summary, bootstrap_ci, friedman_with_posthoc, wilcoxon_signed_rank
+
 
 @dataclass
 class SeedResult:
@@ -80,6 +82,11 @@ class ExperimentResult:
         lo, hi = stats.t.interval(0.95, n - 1, loc=mean, scale=se)
         return (float(lo), float(hi))
 
+    def bootstrap_ci(self, attr: str = "cumulative_return") -> tuple[float, float]:
+        """95% bootstrap confidence interval."""
+
+        return bootstrap_ci(self._values(attr))
+
     def vs_baseline(self, baseline: "ExperimentResult", attr: str = "cumulative_return") -> dict[str, Any]:
         """Welch's t-test + Cohen's d against a baseline method."""
 
@@ -100,6 +107,26 @@ class ExperimentResult:
             "significant_005": bool(p_value < 0.05),
             "significant_001": bool(p_value < 0.01),
             "effect_size_cohens_d": _cohens_d(a, b),
+        }
+
+    def robust_vs_baseline(self, baseline: "ExperimentResult", attr: str = "cumulative_return") -> dict[str, Any]:
+        """Robust paired/non-parametric statistics against a baseline method."""
+
+        a = np.asarray(self._values(attr), dtype=np.float64)
+        b = np.asarray(baseline._values(attr), dtype=np.float64)
+        if len(a) == 0 or len(b) == 0:
+            return {
+                "bootstrap_ci": [0.0, 0.0],
+                "wilcoxon": {"statistic": 0.0, "p_value": 1.0, "n": 0},
+                "bayesian": {"mean_diff": 0.0, "prob_left_gt_right": 0.5, "credible_interval": [0.0, 0.0]},
+            }
+        pair_count = min(len(a), len(b))
+        paired_a = a[:pair_count]
+        paired_b = b[:pair_count]
+        return {
+            "bootstrap_ci": list(bootstrap_ci(a)),
+            "wilcoxon": wilcoxon_signed_rank(paired_a, paired_b),
+            "bayesian": bayesian_effect_summary(a, b),
         }
 
     def summary_row(self, attr: str = "cumulative_return") -> str:
@@ -131,6 +158,18 @@ def run_multi_seed(
             seed_result.seed = int(seed)
         result.seed_results.append(seed_result)
     return result
+
+
+def compare_methods_robustly(
+    results: dict[str, ExperimentResult],
+    attr: str = "cumulative_return",
+) -> dict[str, Any]:
+    samples = {
+        method: np.asarray(result._values(attr), dtype=np.float64)
+        for method, result in results.items()
+        if result.seed_results
+    }
+    return friedman_with_posthoc(samples)
 
 
 def results_to_latex(

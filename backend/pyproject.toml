@@ -26,17 +26,30 @@ classifiers = [
 ]
 dependencies = [
   "filelock>=3.16",
+  "fastapi>=0.116",
+  "jinja2>=3.1",
   "matplotlib>=3.9",
   "numpy>=1.26",
   "pandas>=2.2",
+  "pyyaml>=6.0",
   "rich>=13.9",
   "scikit-learn>=1.5",
+  "scipy>=1.13",
+  "tensorboard>=2.18",
   "torch>=2.7",
+  "uvicorn>=0.35",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "ruff>=0.15",
 ]
 
 [project.scripts]
 regimeforge-tui = "regime_lens.tui:main"
 regimeforge-experiments = "regime_lens.run_experiments:main"
+regimeforge-dashboard = "regime_lens.web:main"
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -44,3 +57,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["regime_lens*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]

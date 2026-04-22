@@ -11,7 +11,11 @@ not learn the regime detector end-to-end with the trading policy.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import numpy as np
+import torch
 from sklearn.mixture import GaussianMixture  # lightweight HMM proxy
 
 from .config import REGIME_LABELS
@@ -93,6 +97,21 @@ class RegimeDetector:
         skew = float(np.mean(((window - mean) / std) ** 3))
         return np.array([mean, std, skew], dtype=np.float64)
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "n_components": self.n_components,
+            "window_size": self.window_size,
+            "seed": self.seed,
+            "model": self.model,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.n_components = int(state.get("n_components", self.n_components))
+        self.window_size = int(state.get("window_size", self.window_size))
+        self.seed = int(state.get("seed", self.seed))
+        model = state.get("model")
+        self.model = model if isinstance(model, GaussianMixture) else None
+
 
 # ---------------------------------------------------------------------------
 # HMM-augmented DQN agent
@@ -120,6 +139,7 @@ class HMMDQNAgent(DQNAgent):
         seed: int,
         n_components: int = 4,
         window_size: int = 10,
+        **kwargs,
     ):
         # observation = base features + GMM probabilities
         augmented_dim = base_observation_dim + n_components
@@ -134,6 +154,7 @@ class HMMDQNAgent(DQNAgent):
             batch_size=batch_size,
             device=device,
             seed=seed,
+            **kwargs,
         )
         self._base_dim = base_observation_dim
         self._n_components = n_components
@@ -147,3 +168,15 @@ class HMMDQNAgent(DQNAgent):
         """Append GMM regime probabilities to the base observation."""
         probs = self.detector.infer_single(recent_returns).astype(np.float32)
         return np.concatenate([np.asarray(base_state, dtype=np.float32), probs])
+
+    def save_checkpoint(self, directory: str | Path) -> None:
+        super().save_checkpoint(directory)
+        torch.save(self.detector.state_dict(), Path(directory) / "detector.pt")
+
+    def load_checkpoint(self, directory: str | Path, weights_only: bool = True) -> None:
+        super().load_checkpoint(directory, weights_only=weights_only)
+        detector_path = Path(directory) / "detector.pt"
+        if detector_path.exists():
+            detector_state = torch.load(detector_path, map_location="cpu", weights_only=False)
+            if isinstance(detector_state, dict):
+                self.detector.load_state_dict(detector_state)

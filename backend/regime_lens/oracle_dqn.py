@@ -34,6 +34,7 @@ class OracleDQNAgent(DQNAgent):
         batch_size: int,
         device: str,
         seed: int,
+        **kwargs,
     ):
         n_regimes = len(REGIME_LABELS)
         super().__init__(
@@ -47,6 +48,7 @@ class OracleDQNAgent(DQNAgent):
             batch_size=batch_size,
             device=device,
             seed=seed,
+            **kwargs,
         )
         self._base_dim = base_observation_dim
         self._n_regimes = n_regimes
