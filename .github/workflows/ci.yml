@@ -35,6 +35,8 @@ jobs:
 
       - name: Pytest
         working-directory: backend
+        env:
+          PYTHONPATH: ..
         run: python -m pytest -q
 
       - name: Experiment planning smoke test
