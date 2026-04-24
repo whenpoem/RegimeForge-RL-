@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import multiprocessing as mp
 import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -826,12 +827,21 @@ def _execute_jobs(jobs: list[dict[str, Any]], parallel_workers: int) -> list[dic
         return [_execute_seed_job(job) for job in jobs]
 
     results: list[dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=min(parallel_workers, len(jobs))) as executor:
+    with ProcessPoolExecutor(
+        max_workers=min(parallel_workers, len(jobs)),
+        mp_context=_process_pool_context(),
+    ) as executor:
         future_map = {executor.submit(_execute_seed_job, job): job for job in jobs}
         for future in as_completed(future_map):
             results.append(future.result())
     results.sort(key=lambda item: int(item["index"]))
     return results
+
+
+def _process_pool_context() -> mp.context.BaseContext:
+    if "spawn" in mp.get_all_start_methods():
+        return mp.get_context("spawn")
+    return mp.get_context()
 
 
 def _seed_results_from_job_payloads(

@@ -35,9 +35,10 @@ jobs:
 
       - name: Pytest
         working-directory: backend
+        timeout-minutes: 15
         env:
           PYTHONPATH: ..
-        run: python -m pytest -q
+        run: python -m pytest -vv --durations=20
 
       - name: Experiment planning smoke test
         run: python -m regime_lens.run_experiments plan --suite smoke

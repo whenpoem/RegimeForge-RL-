@@ -7,6 +7,7 @@ from pathlib import Path
 from backend.regime_lens.config import TrainingConfig
 from backend.regime_lens.run_experiments import (
     _build_jobs,
+    _process_pool_context,
     _run_trained_seed,
     build_suite,
     report_experiments,
@@ -16,6 +17,9 @@ from backend.regime_lens.training import TrainingManager
 
 
 class RunnerFeatureTests(unittest.TestCase):
+    def test_parallel_executor_uses_spawn_context(self) -> None:
+        self.assertEqual(_process_pool_context().get_start_method(), "spawn")
+
     def test_resume_staging_across_artifact_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
