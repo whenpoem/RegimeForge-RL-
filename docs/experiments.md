@@ -19,6 +19,7 @@ The runner supports these suites:
 
 - `ood`
   - Out-of-distribution generalization tests.
+  - Supports persistence, fast switching, high volatility, and drift variants.
 
 - `all`
   - Combines the full benchmark, ablations, and OOD sweeps.
@@ -33,6 +34,9 @@ Common OOD modes:
 
 - `volatility`
   - Higher-volatility regime dynamics.
+
+- `drift`
+  - Non-stationary regime drift for continuous robustness checks.
 
 Common ablation modes:
 
@@ -81,37 +85,55 @@ What they mean:
 Plan a suite without running it:
 
 ```bash
-python -m backend.regime_lens.run_experiments plan --suite smoke
+python -m regime_lens.run_experiments plan --suite smoke
 ```
 
 Run the smoke suite:
 
 ```bash
-python -m backend.regime_lens.run_experiments run --suite smoke --experiment-name regimeforge_smoke
+python -m regime_lens.run_experiments run --suite smoke --experiment-name regimeforge_smoke
 ```
 
 Run the full benchmark with a custom device:
 
 ```bash
-python -m backend.regime_lens.run_experiments run --suite full --device cpu --experiment-name regimeforge_full
+python -m regime_lens.run_experiments run --suite full --device cpu --experiment-name regimeforge_full
 ```
 
 Run an ablation sweep:
 
 ```bash
-python -m backend.regime_lens.run_experiments run --suite ablation --ablation-kind experts --experiment-name regimeforge_ablation
+python -m regime_lens.run_experiments run --suite ablation --ablation-kind experts --experiment-name regimeforge_ablation
 ```
 
 Run an OOD sweep:
 
 ```bash
-python -m backend.regime_lens.run_experiments run --suite ood --ood-kind volatility --experiment-name regimeforge_ood
+python -m regime_lens.run_experiments run --suite ood --ood-kind volatility --experiment-name regimeforge_ood
+```
+
+Run a continuous-action smoke suite:
+
+```bash
+python -m regime_lens.run_experiments run --suite smoke --algorithm sac --continuous-actions --episodes 1 --evaluation-episodes 1
+```
+
+Run with local YAML or TOML config:
+
+```bash
+python -m regime_lens.run_experiments run --suite smoke --config experiments/smoke.yaml
+```
+
+Serve the artifact dashboard:
+
+```bash
+python -m regime_lens.run_experiments serve --artifact-root D:\RL\backend\artifacts
 ```
 
 Rebuild a report from an existing manifest:
 
 ```bash
-python -m backend.regime_lens.run_experiments report --manifest D:\RL\backend\artifacts\_experiments\regimeforge_smoke\<timestamp>\manifest.json
+python -m regime_lens.run_experiments report --manifest D:\RL\backend\artifacts\_experiments\regimeforge_smoke\<timestamp>\manifest.json
 ```
 
 Useful flags:
@@ -143,6 +165,21 @@ Useful flags:
 - `--json`
   - Emit machine-readable output.
 
+- `--config`
+  - Load a YAML, TOML, or JSON config file with optional inheritance.
+
+- `--algorithm`
+  - Select `dqn`, `ppo`, or `sac`.
+
+- `--continuous-actions`
+  - Run the continuous environment path.
+
+- `--parallel-workers`
+  - Run specs/seeds in isolated worker artifact roots.
+
+- `--resume-run` and `--resume-checkpoint`
+  - Continue training from saved model and replay/rollout state.
+
 ## Result layout
 
 Every suite run writes a timestamped bundle under:
@@ -165,6 +202,10 @@ Typical outputs:
 
 - `results.tex`
   - LaTeX table for paper or appendix use.
+
+Trained checkpoint directories also contain model weights, stats, resume state, explainability,
+and reproducibility payloads. Reports are generated from those artifacts, so `report` can rebuild
+the Markdown/JSON/LaTeX bundle from a saved `manifest.json`.
 
 ## How to read the results
 
@@ -190,4 +231,3 @@ Interpretation shortcuts:
 3. Run `ablation` to test architectural choices.
 4. Run `ood` to check generalization.
 5. Export the report bundle and include the Markdown and LaTeX outputs in your GitHub release or paper notes.
-

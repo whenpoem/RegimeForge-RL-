@@ -164,7 +164,7 @@ def _continuous_action_labels(env: Any) -> list[str]:
 
 def _continuous_surface_state(env: Any, trend_gap_pct: float, volatility_pct: float) -> np.ndarray:
     if hasattr(env, "asset_names"):
-        asset_names = tuple(getattr(env, "asset_names"))
+        asset_names = tuple(env.asset_names)
         if len(asset_names) > 1:
             base_env = SyntheticMarketEnv(env.config)
             base_state = base_env.baseline_state(trend_gap_pct=trend_gap_pct, volatility_pct=volatility_pct)
@@ -550,8 +550,8 @@ class TrainingManager:
         agent_kwargs: dict[str, int] = {}
         if _is_continuous_config(config):
             agent_kwargs = {
-                "observation_dim": int(getattr(env, "observation_dim")),
-                "action_dim": int(getattr(env, "action_dim")),
+                "observation_dim": int(env.observation_dim),
+                "action_dim": int(env.action_dim),
             }
         agent = _create_agent(config, resolved_device, **agent_kwargs)
         return env, agent
@@ -1210,6 +1210,17 @@ class TrainingManager:
         evaluation_seeds = config.fixed_eval_seeds[: config.evaluation_episodes]
 
         for eval_index, seed in enumerate(evaluation_seeds):
+            random_rng = np.random.default_rng(seed + 31)
+
+            def random_continuous_policy(
+                _state: np.ndarray,
+                _step: int,
+                *,
+                rng: np.random.Generator = random_rng,
+                action_dim: int = agent.action_dim,
+            ) -> np.ndarray:
+                return rng.uniform(-1.0, 1.0, size=action_dim).astype(np.float32)
+
             trace = self._rollout_continuous(
                 config,
                 agent,
@@ -1225,7 +1236,7 @@ class TrainingManager:
             random_trace = self._rollout_continuous(
                 config,
                 agent,
-                policy=lambda _state, _step, rng=np.random.default_rng(seed + 31), action_dim=agent.action_dim: rng.uniform(-1.0, 1.0, size=action_dim).astype(np.float32),
+                policy=random_continuous_policy,
                 seed=seed,
                 include_trace=False,
             )
@@ -1467,6 +1478,16 @@ class TrainingManager:
 
         evaluation_seeds = config.fixed_eval_seeds[: config.evaluation_episodes]
         for eval_index, seed in enumerate(evaluation_seeds):
+            random_rng = np.random.default_rng(seed + 31)
+
+            def random_discrete_policy(
+                _state: np.ndarray,
+                _step: int,
+                *,
+                rng: np.random.Generator = random_rng,
+            ) -> int:
+                return int(rng.integers(0, len(ACTION_VALUES)))
+
             trace = self._rollout(
                 config,
                 agent,
@@ -1482,7 +1503,7 @@ class TrainingManager:
             random_trace = self._rollout(
                 config,
                 agent,
-                policy=lambda _state, _step, rng=np.random.default_rng(seed + 31): int(rng.integers(0, len(ACTION_VALUES))),
+                policy=random_discrete_policy,
                 seed=seed,
                 include_trace=False,
             )

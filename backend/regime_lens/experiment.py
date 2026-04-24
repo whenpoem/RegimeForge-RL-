@@ -241,5 +241,5 @@ def _config_with_seed(config: Any, seed: int) -> Any:
     if is_dataclass(config):
         return replace(config, seed=seed)
     cloned = deepcopy(config)
-    setattr(cloned, "seed", seed)
+    cloned.seed = seed
     return cloned

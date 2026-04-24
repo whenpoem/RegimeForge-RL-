@@ -5,11 +5,11 @@ The package name is `regime_lens`.
 
 ## What Lives Here
 
-- Synthetic market generation and hidden-regime dynamics
-- DQN, Oracle DQN, HMM+DQN, and RCMoE-DQN implementations
-- Training orchestration, artifact writing, and checkpoint evaluation
-- Rich terminal dashboard
-- Experiment runner and report generation utilities
+- Synthetic and continuous market generation with hidden-regime dynamics
+- DQN, Oracle DQN, HMM+DQN, RCMoE-DQN, PPO, SAC, and continuous RCMoE implementations
+- Training orchestration, model checkpoints, resume state, artifact writing, and checkpoint evaluation
+- Rich terminal dashboard and FastAPI artifact dashboard
+- Experiment runner, parallel execution, robust statistics, and report generation utilities
 - Visualization and LaTeX export helpers
 
 ## Install
@@ -30,13 +30,25 @@ D:\miniconda\envs\statshell\python.exe -m regime_lens.tui --fresh --lang en --ch
 Plan the benchmark suite:
 
 ```powershell
-D:\miniconda\envs\statshell\python.exe -m backend.regime_lens.run_experiments plan --suite full
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments plan --suite full
 ```
 
 Run a smoke suite:
 
 ```powershell
-D:\miniconda\envs\statshell\python.exe -m backend.regime_lens.run_experiments run --suite smoke --experiment-name smoke_demo
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments run --suite smoke --experiment-name smoke_demo
+```
+
+Run a continuous-action SAC smoke suite:
+
+```powershell
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments run --suite smoke --algorithm sac --continuous-actions --episodes 1 --evaluation-episodes 1
+```
+
+Serve the artifact dashboard:
+
+```powershell
+D:\miniconda\envs\statshell\python.exe -m regime_lens.web --artifact-root D:\RL\backend\artifacts
 ```
 
 ## Artifact Conventions
@@ -53,8 +65,15 @@ artifacts/
     `-- checkpoints/
         `-- ckpt-<episode>/
             |-- summary.json
+            |-- stats.json
+            |-- resume_state.json
+            |-- repro.json
+            |-- policy.json
+            |-- embedding.json
+            |-- explainability.json
             |-- regime_analysis.json
-            `-- expert_analysis.json
+            |-- expert_analysis.json
+            `-- weights/
 ```
 
 Experiment bundles are written under `artifacts/_experiments/` and

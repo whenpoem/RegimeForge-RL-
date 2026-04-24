@@ -708,7 +708,7 @@ def _build_jobs(
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     use_isolated_roots = suite.base_config.parallel_workers > 1
-    for job_index, spec in enumerate(suite.specs):
+    for spec in suite.specs:
         for seed in suite.base_config.seeds:
             artifact_root = (
                 output_root / "_worker_runs" / spec.key / f"seed-{seed}"

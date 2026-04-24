@@ -1,8 +1,8 @@
 # RegimeForge
 
 **RegimeForge** is a regime-aware reinforcement learning workbench for synthetic trading research.
-It combines a hidden-regime market simulator, multiple agent baselines, a live terminal dashboard,
-and experiment tooling for ablations, OOD sweeps, and artifact-driven analysis.
+It combines hidden-regime market simulators, multiple discrete and continuous RL baselines,
+live dashboards, and experiment tooling for ablations, OOD sweeps, and artifact-driven analysis.
 
 The public project name is **RegimeForge**. The internal Python package remains
 `regime_lens` for compatibility.
@@ -15,45 +15,62 @@ trajectory?
 
 To make that inspectable, the project focuses on three things:
 
-- A synthetic market with explicit hidden regimes such as `bull`, `bear`, `chop`, and `shock`
-- Multiple policy families, including a regime-conditioned mixture-of-experts agent
-- Instrumentation that exposes training progress, checkpoint performance, regime alignment, and expert specialization
+- Synthetic and semi-realistic market configurations with explicit hidden regimes such as `bull`, `bear`, `chop`, and `shock`
+- Multiple policy families, including discrete DQN agents and continuous actor-critic agents
+- Instrumentation that exposes training progress, checkpoint performance, regime alignment, expert specialization, and reproducibility metadata
 
 ## Core Features
 
-- Synthetic hidden-regime market environment with configurable transition matrix and per-regime dynamics
-- Multiple agent variants: vanilla DQN, Oracle DQN, HMM+DQN, and RCMoE-DQN
-- Terminal-first dashboard with five views for training, regime analysis, experts, performance, and config
-- Experiment runner for smoke tests, full benchmarks, ablations, and OOD generalization sweeps
-- Artifact pipeline for checkpoints, summaries, metrics, regime analysis, and expert analysis
+- Synthetic hidden-regime market environments with configurable transition matrices and per-regime dynamics
+- Semi-realistic data mode that fits regime parameters from local price CSVs and injects them into training configs
+- Discrete agent variants: vanilla DQN, Oracle DQN, HMM+DQN, and RCMoE-DQN
+- Continuous actor-critic variants for PPO, SAC, and gated RCMoE actor-critic experiments
+- Multi-asset and non-stationary continuous market paths for robustness checks
+- Terminal dashboard and FastAPI artifact dashboard for inspecting runs and checkpoints
+- Experiment runner for smoke tests, full benchmarks, ablations, OOD sweeps, parallel execution, and report rebuilds
+- Artifact pipeline for model weights, resume state, summaries, metrics, stats, explainability, and reproducibility metadata
 - Visualization helpers for curves, heatmaps, policy surfaces, gate evolution, and LaTeX export
 
 ## Project Snapshot
 
 ```mermaid
 flowchart LR
-    A["Synthetic Market"] --> B["Training Manager"]
-    B --> C["Agent Variants"]
+    A["Market Environments"] --> B["Training Manager"]
+    B --> C["Discrete + Continuous Agents"]
     C --> D["Artifacts"]
     D --> E["TUI Dashboard"]
-    D --> F["Experiment Reports"]
-    D --> G["Visualization Exports"]
+    D --> F["Web Dashboard"]
+    D --> G["Experiment Reports"]
+    D --> H["Visualization Exports"]
 ```
 
 ## Agent Families
 
 - `dqn`: standard DQN baseline with no explicit regime model
 - `oracle_dqn`: upper-bound baseline with true regime one-hot appended to observations
-- `hmm_dqn`: two-stage regime detector plus DQN policy
+- `hmm_dqn`: lightweight GMM detector plus DQN policy, used as the current HMM-style proxy baseline
 - `rcmoe_dqn`: regime-conditioned mixture-of-experts DQN with gate routing and expert specialization analysis
+- `ppo`: continuous actor-critic policy over allocation weights
+- `sac`: off-policy continuous actor-critic policy over allocation weights
+- `rcmoe` actor-critic: gated expert actor-critic path for continuous PPO/SAC variants
 
-## TUI Views
+## Dashboards
+
+The Rich TUI remains the best live training view. The FastAPI dashboard is an artifact-first
+viewer for completed or running experiment directories.
 
 - `Overview`: latest reward, return, epsilon, loss, checkpoints, runtime, and baseline snapshots
 - `Regime Lens`: live regime routing, gate accuracy, clustering alignment, and timeline context
 - `Expert Deep Dive`: expert activations, utilization, dominance, and specialization summaries
 - `Performance`: financial metrics, baseline comparison, and per-regime breakdowns
 - `Config`: reproducibility-focused configuration and runtime context
+
+Start the web dashboard:
+
+```powershell
+cd D:\RL\backend
+D:\miniconda\envs\statshell\python.exe -m regime_lens.web --artifact-root D:\RL\backend\artifacts
+```
 
 Keyboard shortcuts:
 
@@ -78,7 +95,14 @@ RL/
 |   |   |-- rcmoe.py
 |   |   |-- training.py
 |   |   |-- tui.py
+|   |   |-- web.py
 |   |   |-- run_experiments.py
+|   |   |-- continuous_agent.py
+|   |   |-- continuous_market.py
+|   |   |-- config_io.py
+|   |   |-- data.py
+|   |   |-- stats_ext.py
+|   |   |-- explainability.py
 |   |   `-- visualization.py
 |   |-- README.md
 |   `-- pyproject.toml
@@ -117,12 +141,13 @@ cd D:\RL\backend
 D:\miniconda\envs\statshell\python.exe -m regime_lens.tui --fresh --lang en --charset unicode
 ```
 
-### 3. Plan or run experiments
+### 3. Plan, run, or serve experiments
 
 ```powershell
-cd D:\RL
-D:\miniconda\envs\statshell\python.exe -m backend.regime_lens.run_experiments plan --suite full
-D:\miniconda\envs\statshell\python.exe -m backend.regime_lens.run_experiments run --suite smoke --experiment-name demo_smoke
+cd D:\RL\backend
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments plan --suite full
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments run --suite smoke --experiment-name demo_smoke
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments serve --artifact-root D:\RL\backend\artifacts
 ```
 
 ## Experiment Suites
@@ -130,10 +155,17 @@ D:\miniconda\envs\statshell\python.exe -m backend.regime_lens.run_experiments ru
 - `smoke`: short pipeline validation run
 - `full`: core benchmark matrix across agent families and baselines
 - `ablation`: RCMoE sweeps across expert count, gate width, hidden size, and load-balancing weight
-- `ood`: generalization sweeps under altered persistence, switching frequency, or volatility
+- `ood`: generalization sweeps under altered persistence, switching frequency, volatility, or drift
 - `all`: full benchmark plus ablations plus OOD suites
 
 Generated reports are written under `backend/artifacts/_experiments`.
+
+Continuous-action smoke example:
+
+```powershell
+cd D:\RL\backend
+D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments run --suite smoke --algorithm sac --continuous-actions --episodes 1 --evaluation-episodes 1
+```
 
 ## Documentation
 
@@ -144,8 +176,8 @@ Generated reports are written under `backend/artifacts/_experiments`.
 
 ## Engineering Notes
 
-- The repository is terminal-first. There is no web UI or backend API service.
-- The PowerShell launcher is Windows-oriented, but the Python modules are usable directly.
+- The repository is artifact-first. TUI, Web dashboard, reports, and visualization helpers all read the same run/checkpoint layout.
+- The PowerShell launcher is Windows-oriented, but the Python package entry points are usable directly.
 - Artifact directories are intentionally excluded from version control.
 
 ## Contributing

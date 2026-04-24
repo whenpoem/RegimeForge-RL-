@@ -1,6 +1,7 @@
 # RegimeForge UI Guide
 
-This guide explains the terminal dashboard in `backend/regime_lens/tui.py`.
+This guide explains the terminal dashboard in `backend/regime_lens/tui.py` and the artifact
+dashboard in `backend/regime_lens/web.py`.
 
 ## Overview
 
@@ -13,6 +14,9 @@ The UI is organized around five views:
 5. `Config`
 
 The dashboard shows live training data when a run is active. If training has finished, the regime and expert panels fall back to checkpoint analysis so the UI still stays useful.
+
+The Web dashboard is an artifact viewer. It lists runs under the artifact root, opens run detail
+pages, exposes checkpoint payloads, and streams a compact live snapshot over WebSocket.
 
 ## Shortcuts
 
@@ -36,6 +40,28 @@ The dashboard shows live training data when a run is active. If training has fin
 
 - `q` or `Esc`
   - Exit the dashboard.
+
+## Web dashboard
+
+Start it from the backend package:
+
+```bash
+python -m regime_lens.web --artifact-root D:\RL\backend\artifacts
+```
+
+The main routes are:
+
+- `/runs`
+  - List discovered run directories, including parallel worker runs.
+
+- `/runs/{id}`
+  - Show run summary, live payload, and checkpoint index.
+
+- `/checkpoints/{id}/{checkpoint_id}`
+  - Show checkpoint summary, episode trace, policy surface, stats, explainability, and reproducibility payloads.
+
+- `/live/{id}`
+  - WebSocket endpoint for live run snapshots.
 
 ## View-by-view
 
@@ -169,4 +195,3 @@ If you are watching training live, read the UI in this order:
 Some panels only become meaningful for `rcmoe_dqn`.
 
 If you run plain `dqn`, there is no gate or expert system, so the regime and expert panels will have limited or no data. That is expected behavior, not a UI bug.
-
