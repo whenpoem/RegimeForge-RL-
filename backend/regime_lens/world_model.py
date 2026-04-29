@@ -369,6 +369,7 @@ class WorldModelAgent:
             return None
 
         obs = torch.as_tensor(np.stack(self._episode_obs), dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(np.stack(self._episode_actions), dtype=torch.float32, device=self.device)
 
         # Get a starting latent state from real data
         with torch.no_grad():
