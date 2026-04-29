@@ -26,6 +26,8 @@ class AgentType(str, Enum):
     RCMOE_DQN = "rcmoe_dqn"
     ORACLE_DQN = "oracle_dqn"
     HMM_DQN = "hmm_dqn"
+    TRANSFORMER_DQN = "transformer_dqn"
+    WORLD_MODEL = "world_model"
 
 
 class CurriculumMode(str, Enum):
@@ -127,6 +129,19 @@ class TrainingConfig:
     macro_experts: int = 2
     dueling: bool = False
     noisy: bool = False
+
+    # ---- Transformer-specific ----
+    n_heads: int = 4
+    n_layers: int = 2
+    seq_len: int = 16
+    dropout: float = 0.1
+
+    # ---- World Model-specific ----
+    latent_dim: int = 32
+    recurrent_dim: int = 64
+    imag_horizon: int = 15
+    world_model_lr: float = 3e-4
+    use_hmm: bool = True
 
     # ---- Runtime ----
     device: str = "auto"

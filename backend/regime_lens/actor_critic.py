@@ -8,7 +8,8 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
-from .config import AgentType, AlgorithmType, TrainingConfig
+from .config import AgentType, AlgorithmType, GateType, TrainingConfig
+from .rcmoe import HierarchicalGatingNetwork, MLPGatingNetwork, TemporalGatingNetwork
 
 
 LOG_STD_MIN = -5.0
@@ -205,17 +206,21 @@ class SACActorCritic(nn.Module):
         return self.critic_parameters()
 
 
-class _MixtureGate(nn.Module):
-    def __init__(self, observation_dim: int, n_experts: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(observation_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, n_experts),
-        )
-
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        return torch.softmax(self.net(observation), dim=-1)
+def _build_gate(
+    observation_dim: int,
+    n_experts: int,
+    hidden_dim: int,
+    gate_type: GateType = GateType.MLP,
+    context_len: int = 8,
+    hierarchical_moe: bool = False,
+    macro_experts: int = 2,
+) -> nn.Module:
+    """Factory for gating networks, shared with discrete RCMoE."""
+    if hierarchical_moe:
+        return HierarchicalGatingNetwork(observation_dim, n_experts, hidden_dim, macro_experts)
+    if gate_type == GateType.TEMPORAL:
+        return TemporalGatingNetwork(observation_dim, n_experts, hidden_dim, context_len)
+    return MLPGatingNetwork(observation_dim, n_experts, hidden_dim)
 
 
 class _ExpertGaussianActor(nn.Module):
@@ -246,12 +251,26 @@ class RCMoEActorCritic(nn.Module):
         hidden_dim: int = 128,
         n_experts: int = 4,
         gate_hidden_dim: int = 64,
+        gate_type: GateType = GateType.MLP,
+        context_len: int = 8,
+        hierarchical_moe: bool = False,
+        macro_experts: int = 2,
     ):
         super().__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
         self.n_experts = n_experts
-        self.gate = _MixtureGate(observation_dim, n_experts, gate_hidden_dim)
+        self.gate_type = gate_type
+        self.context_len = context_len
+        self._use_temporal = gate_type == GateType.TEMPORAL and not hierarchical_moe
+        # Gate input: temporal context is flattened, otherwise single observation
+        gate_input_dim = observation_dim * context_len if self._use_temporal else observation_dim
+        self.gate = _build_gate(
+            gate_input_dim, n_experts, gate_hidden_dim,
+            gate_type=gate_type, context_len=context_len,
+            hierarchical_moe=hierarchical_moe, macro_experts=macro_experts,
+        )
+        # Experts always see the latest single observation
         self.expert_actors = nn.ModuleList(
             _ExpertGaussianActor(observation_dim, action_dim, hidden_dim) for _ in range(n_experts)
         )
@@ -259,17 +278,25 @@ class RCMoEActorCritic(nn.Module):
             _ExpertValueCritic(observation_dim, hidden_dim) for _ in range(n_experts)
         )
 
+    def _latest_state(self, observation: torch.Tensor) -> torch.Tensor:
+        """Extract the latest single-timestep observation for experts."""
+        if self._use_temporal:
+            seq = observation.view(observation.size(0), self.context_len, self.observation_dim)
+            return seq[:, -1, :]
+        return observation
+
     def expert_outputs(self, observation: torch.Tensor) -> dict[str, torch.Tensor]:
+        latest = self._latest_state(observation)
         gate_weights = self.gate(observation)
         expert_means: list[torch.Tensor] = []
         expert_log_stds: list[torch.Tensor] = []
         expert_values: list[torch.Tensor] = []
 
         for actor, critic in zip(self.expert_actors, self.expert_critics, strict=True):
-            mean, log_std = actor(observation)
+            mean, log_std = actor(latest)
             expert_means.append(mean)
             expert_log_stds.append(log_std)
-            expert_values.append(critic(observation))
+            expert_values.append(critic(latest))
 
         return {
             "gate_weights": gate_weights,
@@ -339,12 +366,24 @@ class RCMoESACActorCritic(nn.Module):
         hidden_dim: int = 128,
         n_experts: int = 4,
         gate_hidden_dim: int = 64,
+        gate_type: GateType = GateType.MLP,
+        context_len: int = 8,
+        hierarchical_moe: bool = False,
+        macro_experts: int = 2,
     ):
         super().__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
         self.n_experts = n_experts
-        self.gate = _MixtureGate(observation_dim, n_experts, gate_hidden_dim)
+        self.gate_type = gate_type
+        self.context_len = context_len
+        self._use_temporal = gate_type == GateType.TEMPORAL and not hierarchical_moe
+        gate_input_dim = observation_dim * context_len if self._use_temporal else observation_dim
+        self.gate = _build_gate(
+            gate_input_dim, n_experts, gate_hidden_dim,
+            gate_type=gate_type, context_len=context_len,
+            hierarchical_moe=hierarchical_moe, macro_experts=macro_experts,
+        )
         self.expert_actors = nn.ModuleList(
             _ExpertGaussianActor(observation_dim, action_dim, hidden_dim) for _ in range(n_experts)
         )
@@ -355,13 +394,20 @@ class RCMoESACActorCritic(nn.Module):
             QHead(observation_dim, action_dim, hidden_dim) for _ in range(n_experts)
         )
 
+    def _latest_state(self, observation: torch.Tensor) -> torch.Tensor:
+        if self._use_temporal:
+            seq = observation.view(observation.size(0), self.context_len, self.observation_dim)
+            return seq[:, -1, :]
+        return observation
+
     def expert_outputs(self, observation: torch.Tensor) -> dict[str, torch.Tensor]:
+        latest = self._latest_state(observation)
         gate_weights = self.gate(observation)
         expert_means: list[torch.Tensor] = []
         expert_log_stds: list[torch.Tensor] = []
 
         for actor in self.expert_actors:
-            mean, log_std = actor(observation)
+            mean, log_std = actor(latest)
             expert_means.append(mean)
             expert_log_stds.append(log_std)
 
@@ -387,9 +433,10 @@ class RCMoESACActorCritic(nn.Module):
         action: torch.Tensor,
         gate_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        latest = self._latest_state(observation)
         gate = self.gate(observation) if gate_weights is None else gate_weights
         expert_values = torch.stack(
-            [critic(observation, action) for critic in critics],
+            [critic(latest, action) for critic in critics],
             dim=1,
         ).squeeze(-1)
         return (gate * expert_values).sum(dim=1, keepdim=True)
@@ -478,22 +525,19 @@ def build_actor_critic(
     elif model_kind == "sac":
         model = SACActorCritic(observation_dim, action_dim, hidden_dim=config.hidden_dim)
     elif model_kind in {"rcmoe", "rcmoe_actor_critic", "moe", "rcmoe_sac", "moe_sac"}:
+        rcmoe_kwargs = dict(
+            hidden_dim=config.hidden_dim,
+            n_experts=config.n_experts,
+            gate_hidden_dim=config.gate_hidden_dim,
+            gate_type=config.gate_type,
+            context_len=max(config.context_len, 1),
+            hierarchical_moe=config.hierarchical_moe,
+            macro_experts=config.macro_experts,
+        )
         if config.algorithm == AlgorithmType.SAC or model_kind in {"rcmoe_sac", "moe_sac"}:
-            model = RCMoESACActorCritic(
-                observation_dim,
-                action_dim,
-                hidden_dim=config.hidden_dim,
-                n_experts=config.n_experts,
-                gate_hidden_dim=config.gate_hidden_dim,
-            )
+            model = RCMoESACActorCritic(observation_dim, action_dim, **rcmoe_kwargs)
         else:
-            model = RCMoEActorCritic(
-                observation_dim,
-                action_dim,
-                hidden_dim=config.hidden_dim,
-                n_experts=config.n_experts,
-                gate_hidden_dim=config.gate_hidden_dim,
-            )
+            model = RCMoEActorCritic(observation_dim, action_dim, **rcmoe_kwargs)
     else:
         raise ValueError(f"Unsupported actor-critic variant: {model_kind}")
 

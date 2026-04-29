@@ -8,6 +8,8 @@ import numpy as np
 from .config import FEATURE_NAMES, REGIME_LABELS, TrainingConfig
 from .market import ObservationView, SyntheticMarketEnv
 
+_ORACLE_FEATURES = len(REGIME_LABELS)
+
 
 @dataclass(slots=True)
 class BoxSpace:
@@ -127,6 +129,16 @@ class _BaseContinuousMarketEnv:
         feature_map["portfolio.gross_exposure"] = float(np.abs(self.positions).sum())
         feature_map["portfolio.net_exposure"] = float(self.positions.sum())
         return ObservationView(state=np.asarray(state_parts, dtype=np.float32), feature_map=feature_map)
+
+    def observe_oracle(self) -> ObservationView:
+        """Return observation with regime one-hot appended (for Oracle agents)."""
+        base = self.observe()
+        regime_onehot = np.zeros(len(REGIME_LABELS), dtype=np.float32)
+        ridx = self.regime_index_at(self.t)
+        if 0 <= ridx < len(REGIME_LABELS):
+            regime_onehot[ridx] = 1.0
+        oracle_state = np.concatenate([base.state, regime_onehot])
+        return ObservationView(state=oracle_state, feature_map=base.feature_map)
 
     def step(
         self, action: float | Sequence[float] | np.ndarray

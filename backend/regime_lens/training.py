@@ -41,6 +41,8 @@ from .oracle_dqn import OracleDQNAgent
 from .rcmoe import RCMoEAgent
 from .runtime import configure_runtime
 from .tracking import create_tracker
+from .transformer_agent import TransformerDQNAgent
+from .world_model import WorldModelAgent
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +55,35 @@ def _create_agent(
     *,
     observation_dim: int | None = None,
     action_dim: int | None = None,
-) -> DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent | ContinuousActorCriticAgent:
+) -> DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent | ContinuousActorCriticAgent | TransformerDQNAgent | WorldModelAgent:
     """Instantiate the correct agent type based on config."""
+    if config.agent_type == AgentType.WORLD_MODEL:
+        if observation_dim is None or action_dim is None:
+            raise ValueError("World model agent requires explicit observation_dim and action_dim.")
+        return WorldModelAgent(
+            observation_dim=observation_dim,
+            action_dim=action_dim,
+            config=config,
+            device=resolved_device,
+        )
     if _is_continuous_config(config):
         if observation_dim is None or action_dim is None:
             raise ValueError("Continuous agents require explicit observation_dim and action_dim.")
+        if config.agent_type == AgentType.HMM_DQN:
+            from .hmm_dqn import HMMContinuousAgent
+            return HMMContinuousAgent(
+                base_observation_dim=observation_dim,
+                action_dim=action_dim,
+                config=config,
+                device=resolved_device,
+                use_hmm=config.use_hmm,
+            )
+        effective_obs_dim = observation_dim
+        if config.agent_type == AgentType.ORACLE_DQN:
+            effective_obs_dim = observation_dim + len(REGIME_LABELS)
         return ContinuousActorCriticAgent(
             config,
-            observation_dim=observation_dim,
+            observation_dim=effective_obs_dim,
             action_dim=action_dim,
             device=resolved_device,
         )
@@ -105,7 +128,28 @@ def _create_agent(
     elif config.agent_type == AgentType.HMM_DQN:
         return HMMDQNAgent(
             base_observation_dim=config.observation_dim,
+            use_hmm=config.use_hmm,
             **common,
+        )
+    elif config.agent_type == AgentType.TRANSFORMER_DQN:
+        return TransformerDQNAgent(
+            observation_dim=config.observation_dim,
+            action_dim=config.action_dim,
+            hidden_dim=config.hidden_dim,
+            learning_rate=config.learning_rate,
+            gamma=config.gamma,
+            tau=config.tau,
+            replay_capacity=config.replay_capacity,
+            batch_size=config.batch_size,
+            device=resolved_device,
+            seed=config.seed,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            seq_len=config.seq_len,
+            dropout=config.dropout,
+            use_per=config.use_per,
+            per_alpha=config.per_alpha,
+            per_epsilon=config.per_epsilon,
         )
     else:
         return DQNAgent(
@@ -124,6 +168,19 @@ def _is_oracle(agent: object) -> bool:
 
 def _is_hmm(agent: object) -> bool:
     return isinstance(agent, HMMDQNAgent)
+
+
+def _is_transformer(agent: object) -> bool:
+    return isinstance(agent, TransformerDQNAgent)
+
+
+def _is_world_model(agent: object) -> bool:
+    return isinstance(agent, WorldModelAgent)
+
+
+def _is_hmm_continuous(agent: object) -> bool:
+    from .hmm_dqn import HMMContinuousAgent
+    return isinstance(agent, HMMContinuousAgent)
 
 
 def _is_continuous_agent(agent: object) -> bool:
@@ -817,6 +874,21 @@ class TrainingManager:
                 },
             )
 
+        if _is_world_model(agent):
+            self._train_loop_world_model(
+                run_id,
+                config,
+                runtime,
+                agent,
+                env,
+                tracker,
+                data_fit=data_fit,
+                global_step=global_step,
+                start_episode=start_episode,
+                elapsed_offset=elapsed_offset,
+            )
+            return
+
         if _is_continuous_config(config):
             self._train_loop_continuous(
                 run_id,
@@ -851,6 +923,8 @@ class TrainingManager:
 
                 if _is_hmm(agent):
                     agent.fit_detector(env.returns[:config.warmup_steps])
+                if _is_transformer(agent):
+                    agent.reset_context()
 
                 while not done:
                     self._resume_event.wait()
@@ -859,6 +933,8 @@ class TrainingManager:
                     elif _is_hmm(agent):
                         recent_ret = env.returns[max(0, env.t - 10) : env.t]
                         obs_state = agent.augment_state(env.observe().state, recent_ret)
+                    elif _is_transformer(agent):
+                        obs_state = state  # transformer handles context internally
                     elif uses_temporal_gate:
                         obs_state = build_temporal_context(context_history, context_len=context_len)
                     else:
@@ -1028,6 +1104,8 @@ class TrainingManager:
         try:
             for episode in range(start_episode, config.episodes + 1):
                 state = env.reset(seed=config.seed + episode)
+                if hasattr(agent, 'reset_context'):
+                    agent.reset_context()
                 done = False
                 episode_reward = 0.0
                 loss_values: list[float] = []
@@ -1036,16 +1114,36 @@ class TrainingManager:
                 net_exposures: list[float] = []
                 gross_exposures: list[float] = []
 
+                is_oracle_continuous = config.agent_type == AgentType.ORACLE_DQN
+                is_hmm_continuous = _is_hmm_continuous(agent)
+
+                if is_hmm_continuous and hasattr(agent, 'fit_detector'):
+                    agent.fit_detector(env.returns[:config.warmup_steps])
+
                 while not done:
                     self._resume_event.wait()
-                    action_info = agent.act(state, deterministic=False)
+                    if is_oracle_continuous:
+                        obs_for_agent = env.observe_oracle().state
+                    elif is_hmm_continuous:
+                        recent_ret = env.returns[max(0, env.t - 10) : env.t]
+                        obs_for_agent = agent.augment_state(state, recent_ret)
+                    else:
+                        obs_for_agent = state
+                    action_info = agent.act(obs_for_agent, deterministic=False)
                     action = np.asarray(action_info["action"], dtype=np.float32).reshape(-1)
                     next_state, reward, done, info = env.step(action)
+                    if is_oracle_continuous:
+                        next_obs_for_agent = env.observe_oracle().state
+                    elif is_hmm_continuous:
+                        next_recent_ret = env.returns[max(0, env.t - 10) : env.t]
+                        next_obs_for_agent = agent.augment_state(next_state, next_recent_ret)
+                    else:
+                        next_obs_for_agent = next_state
                     agent.store(
-                        state,
+                        obs_for_agent,
                         action,
                         reward,
-                        next_state,
+                        next_obs_for_agent,
                         done,
                         log_prob=action_info.get("log_prob"),
                         value=action_info.get("value"),
@@ -1075,7 +1173,7 @@ class TrainingManager:
                     with self._lock:
                         self._live_regime = str(info["regime"])
                         self._live_regime_index = int(info["regime_index"])
-                        gate_weights = agent.gate_weights(state)
+                        gate_weights = agent.gate_weights(obs_for_agent)
                         if gate_weights is not None:
                             gate_weights = gate_weights.astype(np.float64, copy=False)
                             self._live_gate_weights = gate_weights
@@ -1168,6 +1266,152 @@ class TrainingManager:
                     self.store.write_checkpoint(run_id, checkpoint_id, checkpoint_payload)
                     agent.save_checkpoint(self.store.model_weights_dir(run_id, checkpoint_id))
                     tracker.log_checkpoint(episode, checkpoint_payload["summary"])
+                    self.store.write_checkpoint_index(run_id, checkpoint_summaries)
+                    self.store.update_run_summary(
+                        run_id,
+                        {
+                            "checkpoints": [item["checkpointId"] for item in checkpoint_summaries],
+                            "latestCheckpointId": checkpoint_id,
+                        },
+                    )
+
+            self.store.write_metrics(run_id, metrics_series)
+            self.store.update_run_summary(
+                run_id,
+                {
+                    "status": "completed",
+                    "completedAt": datetime.now(tz=UTC).isoformat(),
+                    "currentEpisode": config.episodes,
+                    "globalStep": global_step,
+                    "elapsedSeconds": time.perf_counter() - started_at,
+                },
+            )
+        finally:
+            tracker.close()
+
+    def _train_loop_world_model(
+        self,
+        run_id: str,
+        config: TrainingConfig,
+        runtime: Any,
+        agent: WorldModelAgent,
+        env: Any,
+        tracker: Any,
+        *,
+        data_fit: dict[str, Any] | None,
+        global_step: int,
+        start_episode: int,
+        elapsed_offset: float,
+    ) -> None:
+        started_at = time.perf_counter() - elapsed_offset
+        metrics_series: list[dict[str, Any]] = []
+        checkpoint_summaries: list[dict[str, Any]] = []
+
+        self.store.update_run_summary(
+            run_id,
+            {
+                "runtime": runtime.to_payload(),
+                "agentType": config.agent_type.value,
+                "config": config_to_snapshot(config),
+                "tracking": tracker.status_payload(),
+            },
+        )
+
+        try:
+            for episode in range(start_episode, config.episodes + 1):
+                state = env.reset(seed=config.seed + episode)
+                agent.reset()
+                done = False
+                episode_reward = 0.0
+                step_pnls: list[float] = []
+                step_regimes: list[str] = []
+
+                while not done:
+                    self._resume_event.wait()
+                    action_info = agent.act(state, deterministic=False)
+                    action = np.clip(
+                        np.asarray(action_info["action"], dtype=np.float32).reshape(-1),
+                        -1.0, 1.0,
+                    )
+                    # Map continuous action to discrete for the discrete env
+                    action_idx = 1  # flat
+                    if action[0] > 0.33:
+                        action_idx = 2  # long
+                    elif action[0] < -0.33:
+                        action_idx = 0  # short
+
+                    next_state, reward, done, info = env.step(action_idx)
+                    agent.store_transition(state, action, reward, done)
+                    global_step += 1
+                    episode_reward += float(reward)
+                    pnl_net = float(info["pnl"]) - float(info["transaction_cost"])
+                    step_pnls.append(pnl_net)
+                    step_regimes.append(str(info["regime"]))
+                    state = next_state
+
+                # Train world model + actor/critic after episode
+                update_metrics = agent.update()
+                if update_metrics is None:
+                    update_metrics = {}
+
+                fin_metrics = episode_metrics(np.asarray(step_pnls, dtype=np.float64), step_regimes, REGIME_LABELS)
+                metric_entry: dict[str, Any] = {
+                    "episode": episode,
+                    "globalStep": global_step,
+                    "epsilon": None,
+                    "totalReward": float(episode_reward),
+                    "strategyReturn": float(np.sum(step_pnls)),
+                    "marketReturn": _market_return(env, config),
+                    "sharpe": fin_metrics.get("sharpe"),
+                    "sortino": fin_metrics.get("sortino"),
+                    "maxDrawdown": fin_metrics.get("max_drawdown"),
+                    "winRate": fin_metrics.get("win_rate"),
+                }
+                if update_metrics:
+                    metric_entry["worldModelLoss"] = update_metrics.get("world_loss")
+                    metric_entry["avgLoss"] = update_metrics.get("actor_loss")
+                metrics_series.append(metric_entry)
+                tracker.log_episode(episode, metric_entry)
+
+                self.store.update_run_summary(
+                    run_id,
+                    {
+                        "currentEpisode": episode,
+                        "latestCheckpointId": checkpoint_summaries[-1]["checkpointId"] if checkpoint_summaries else None,
+                        "episodeLength": config.episode_length,
+                        "featureNames": list(FEATURE_NAMES),
+                        "actionLabels": ["short", "flat", "long"],
+                        "regimeLabels": REGIME_LABELS,
+                        "episodesPlanned": config.episodes,
+                        "globalStep": global_step,
+                        "elapsedSeconds": time.perf_counter() - started_at,
+                        "agentType": config.agent_type.value,
+                    },
+                )
+
+                if episode % config.metrics_flush_interval == 0 or episode == config.episodes:
+                    self.store.write_metrics(run_id, metrics_series)
+
+                if episode % config.checkpoint_interval == 0 or episode == config.episodes:
+                    checkpoint_id = f"ckpt-{episode:04d}"
+                    summary: dict[str, Any] = {
+                        "checkpointId": checkpoint_id,
+                        "episode": episode,
+                        "capturedAt": datetime.now(tz=UTC).isoformat(),
+                        "avgEvalReward": float(episode_reward),
+                        "agentReturn": float(np.sum(step_pnls)),
+                        "financialMetrics": fin_metrics,
+                    }
+                    checkpoint_payload = {
+                        "summary": summary,
+                        "episode": {"steps": [], "financialMetrics": fin_metrics},
+                        "policy": {"cells": []},
+                        "embedding": {"states": []},
+                    }
+                    checkpoint_summaries.append(summary)
+                    self.store.write_checkpoint(run_id, checkpoint_id, checkpoint_payload)
+                    agent.save_checkpoint(self.store.model_weights_dir(run_id, checkpoint_id))
+                    tracker.log_checkpoint(episode, summary)
                     self.store.write_checkpoint_index(run_id, checkpoint_summaries)
                     self.store.update_run_summary(
                         run_id,
@@ -1347,6 +1591,7 @@ class TrainingManager:
     ) -> dict[str, Any]:
         env = _build_env(config)
         state = env.reset(seed=seed)
+        is_oracle = config.agent_type == AgentType.ORACLE_DQN
         done = False
         step = 0
         cumulative_reward = 0.0
@@ -1361,7 +1606,8 @@ class TrainingManager:
 
         while not done:
             view = env.observe()
-            action = np.asarray(policy(state, step), dtype=np.float32).reshape(-1)
+            obs_for_policy = env.observe_oracle().state if is_oracle else state
+            action = np.asarray(policy(obs_for_policy, step), dtype=np.float32).reshape(-1)
             next_state, reward, done, info = env.step(action)
             positions = np.asarray(info.get("positions", action), dtype=np.float32).reshape(-1)
             regime = str(info["regime"])
@@ -1373,9 +1619,9 @@ class TrainingManager:
             step_regimes.append(regime)
             net_exposures.append(float(positions.sum()))
             gross_exposures.append(float(np.abs(positions).sum()))
-            states_for_embedding.append(agent.hidden_activations(state))
+            states_for_embedding.append(agent.hidden_activations(obs_for_policy))
 
-            gate_weights = agent.gate_weights(state)
+            gate_weights = agent.gate_weights(obs_for_policy)
             if gate_weights is not None:
                 gate_weights_list.append(gate_weights.tolist())
 

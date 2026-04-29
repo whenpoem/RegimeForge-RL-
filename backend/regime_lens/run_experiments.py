@@ -171,6 +171,14 @@ def _build_full_suite(base_config: TrainingConfig) -> SuitePlan:
             tags=("full", "baseline"),
         ),
         ExperimentSpec(
+            key="transformer_dqn",
+            method_name="Transformer-DQN",
+            kind="trained",
+            description="Transformer encoder over observation history.",
+            config_overrides={"agent_type": AgentType.TRANSFORMER_DQN},
+            tags=("full", "transformer"),
+        ),
+        ExperimentSpec(
             key="random",
             method_name="Random",
             kind="baseline",
@@ -187,7 +195,7 @@ def _build_full_suite(base_config: TrainingConfig) -> SuitePlan:
             tags=("full", "baseline"),
         ),
     ]
-    return SuitePlan("full", specs, base_config, "Core method matrix: 7 methods x 5 seeds x 6 eval seeds.")
+    return SuitePlan("full", specs, base_config, "Core method matrix: 8 methods x 5 seeds x 6 eval seeds.")
 
 
 def _build_smoke_suite(base_config: TrainingConfig) -> SuitePlan:

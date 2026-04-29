@@ -15,7 +15,9 @@ from .actor_critic import (
     SACActorCritic,
     build_actor_critic,
 )
-from .config import AlgorithmType, AgentType, TrainingConfig, config_to_snapshot
+from .config import AlgorithmType, AgentType, GateType, TrainingConfig, config_to_snapshot
+from .context import build_temporal_context, initialise_context_history, append_context_state
+from .dqn import SumTree
 
 
 def _resolve_device(device: str | None, fallback: str) -> torch.device:
@@ -155,6 +157,151 @@ class ContinuousReplayBuffer:
         self.index = index
 
 
+class ContinuousPrioritizedReplayBuffer:
+    """Prioritized replay buffer for continuous observations and actions."""
+
+    def __init__(
+        self,
+        capacity: int,
+        observation_dim: int,
+        action_dim: int,
+        alpha: float = 0.6,
+        epsilon: float = 1e-6,
+    ):
+        self.capacity = capacity
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.tree = SumTree(capacity)
+        self.observations = np.empty((capacity, observation_dim), dtype=np.float32)
+        self.actions = np.empty((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.empty(capacity, dtype=np.float32)
+        self.next_observations = np.empty((capacity, observation_dim), dtype=np.float32)
+        self.dones = np.empty(capacity, dtype=np.float32)
+        self.index = 0
+        self.size = 0
+        self._max_priority = 1.0
+
+    def __len__(self) -> int:
+        return self.size
+
+    def add(
+        self,
+        observation: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_observation: np.ndarray,
+        done: bool,
+    ) -> None:
+        self.observations[self.index] = observation
+        self.actions[self.index] = action
+        self.rewards[self.index] = float(reward)
+        self.next_observations[self.index] = next_observation
+        self.dones[self.index] = float(done)
+        self.tree.add(self._max_priority ** self.alpha)
+        self.index = (self.index + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(
+        self,
+        batch_size: int,
+        rng: np.random.Generator,
+        beta: float = 0.4,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        indices = np.empty(batch_size, dtype=np.int64)
+        priorities = np.empty(batch_size, dtype=np.float64)
+        total = self.tree.total
+        segment = total / batch_size
+        for i in range(batch_size):
+            low = segment * i
+            high = segment * (i + 1)
+            value = rng.uniform(low, high)
+            leaf_idx = self.tree.sample(value)
+            leaf_idx = max(0, min(leaf_idx, self.size - 1))
+            indices[i] = leaf_idx
+            priorities[i] = max(self.tree.get_priority(leaf_idx), self.epsilon)
+        probs = priorities / (total + 1e-10)
+        is_weights = (self.size * probs) ** (-beta)
+        is_weights = is_weights / (is_weights.max() + 1e-10)
+        return (
+            self.observations[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_observations[indices],
+            self.dones[indices],
+            is_weights.astype(np.float32),
+            indices,
+        )
+
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray) -> None:
+        for idx, td_error in zip(indices, td_errors, strict=True):
+            priority = (abs(float(td_error)) + self.epsilon) ** self.alpha
+            self._max_priority = max(self._max_priority, abs(float(td_error)) + self.epsilon)
+            self.tree.update(int(idx), priority)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "continuous_prioritized",
+            "capacity": self.capacity,
+            "observation_dim": self.observation_dim,
+            "action_dim": self.action_dim,
+            "alpha": self.alpha,
+            "epsilon": self.epsilon,
+            "max_priority": self._max_priority,
+            "index": self.index,
+            "size": self.size,
+            "observations": self.observations.copy(),
+            "actions": self.actions.copy(),
+            "rewards": self.rewards.copy(),
+            "next_observations": self.next_observations.copy(),
+            "dones": self.dones.copy(),
+            "tree": self.tree.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if str(state.get("kind")) != "continuous_prioritized":
+            raise ValueError("Checkpoint buffer kind does not match ContinuousPrioritizedReplayBuffer.")
+        if int(state.get("capacity", -1)) != self.capacity:
+            raise ValueError("Checkpoint replay capacity does not match the current agent.")
+        if int(state.get("observation_dim", -1)) != self.observation_dim:
+            raise ValueError("Checkpoint observation dimension does not match the current agent.")
+        if int(state.get("action_dim", -1)) != self.action_dim:
+            raise ValueError("Checkpoint action dimension does not match the current agent.")
+        observations = np.asarray(state["observations"], dtype=np.float32)
+        actions = np.asarray(state["actions"], dtype=np.float32)
+        rewards = np.asarray(state["rewards"], dtype=np.float32)
+        next_observations = np.asarray(state["next_observations"], dtype=np.float32)
+        dones = np.asarray(state["dones"], dtype=np.float32)
+        if observations.shape != (self.capacity, self.observation_dim):
+            raise ValueError("Checkpoint replay observations have an unexpected shape.")
+        if actions.shape != (self.capacity, self.action_dim):
+            raise ValueError("Checkpoint replay actions have an unexpected shape.")
+        if next_observations.shape != (self.capacity, self.observation_dim):
+            raise ValueError("Checkpoint replay next observations have an unexpected shape.")
+        if rewards.shape != (self.capacity,) or dones.shape != (self.capacity,):
+            raise ValueError("Checkpoint replay rewards or dones have unexpected shapes.")
+        size = int(state.get("size", 0))
+        index = int(state.get("index", 0))
+        if not 0 <= size <= self.capacity:
+            raise ValueError("Checkpoint replay size is invalid.")
+        if not 0 <= index < self.capacity:
+            raise ValueError("Checkpoint replay index is invalid.")
+        self.observations[...] = observations
+        self.actions[...] = actions
+        self.rewards[...] = rewards
+        self.next_observations[...] = next_observations
+        self.dones[...] = dones
+        self.size = size
+        self.index = index
+        self.alpha = float(state.get("alpha", self.alpha))
+        self.epsilon = float(state.get("epsilon", self.epsilon))
+        self._max_priority = float(state.get("max_priority", self._max_priority))
+        tree_state = state.get("tree")
+        if isinstance(tree_state, dict):
+            self.tree.load_state_dict(tree_state)
+
+
 class RolloutBuffer:
     def __init__(self, observation_dim: int, action_dim: int):
         self.observation_dim = observation_dim
@@ -281,6 +428,14 @@ class ContinuousActorCriticAgent:
         if torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.manual_seed_all(config.seed)
 
+        self._use_temporal_context = (
+            config.agent_type == AgentType.RCMOE_DQN
+            and config.gate_type == GateType.TEMPORAL
+            and not config.hierarchical_moe
+        )
+        self._context_len = max(config.context_len, 1)
+        self._context_history: Any = None  # Deque, initialised on first act()
+
         self.model = build_actor_critic(
             config,
             observation_dim=observation_dim,
@@ -288,7 +443,7 @@ class ContinuousActorCriticAgent:
             device=str(self.device),
             variant=self.variant,
         )
-        self.buffer: RolloutBuffer | ContinuousReplayBuffer
+        self.buffer: RolloutBuffer | ContinuousReplayBuffer | ContinuousPrioritizedReplayBuffer
         self.optimizer: torch.optim.Optimizer | None = None
         self.actor_optimizer: torch.optim.Optimizer | None = None
         self.critic_optimizer: torch.optim.Optimizer | None = None
@@ -316,15 +471,33 @@ class ContinuousActorCriticAgent:
             self.target_model.eval()
             for parameter in self.target_model.parameters():
                 parameter.requires_grad_(False)
-            self.buffer = ContinuousReplayBuffer(config.replay_capacity, observation_dim, action_dim)
+            if config.use_per:
+                self.buffer = ContinuousPrioritizedReplayBuffer(
+                    config.replay_capacity, observation_dim, action_dim,
+                    alpha=config.per_alpha, epsilon=config.per_epsilon,
+                )
+            else:
+                self.buffer = ContinuousReplayBuffer(config.replay_capacity, observation_dim, action_dim)
+
+    def _build_model_input(self, observation: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+        """Build the input for the model, handling temporal context if needed."""
+        if not self._use_temporal_context:
+            return observation
+        raw = observation if isinstance(observation, np.ndarray) else observation.detach().cpu().numpy()
+        if self._context_history is None:
+            self._context_history = initialise_context_history(raw, context_len=self._context_len)
+        else:
+            self._context_history = append_context_state(self._context_history, raw)
+        return build_temporal_context(self._context_history, context_len=self._context_len)
 
     def act(
         self,
         observation: np.ndarray | torch.Tensor,
         deterministic: bool = False,
     ) -> dict[str, np.ndarray | torch.Tensor]:
+        model_input = self._build_model_input(observation)
         with torch.inference_mode():
-            outputs = self.model.act(observation, deterministic=deterministic)
+            outputs = self.model.act(model_input, deterministic=deterministic)
         if isinstance(observation, torch.Tensor):
             return outputs
         converted: dict[str, np.ndarray] = {}
@@ -380,7 +553,7 @@ class ContinuousActorCriticAgent:
             )
             return
 
-        assert isinstance(self.buffer, ContinuousReplayBuffer)
+        assert isinstance(self.buffer, (ContinuousReplayBuffer, ContinuousPrioritizedReplayBuffer))
         self.buffer.add(
             observation_array,
             action_array,
@@ -405,9 +578,14 @@ class ContinuousActorCriticAgent:
                 hidden = outputs.get("mean", tensor)
         return hidden.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
+    def reset_context(self) -> None:
+        """Reset the temporal context history (call at episode boundaries)."""
+        self._context_history = None
+
     def gate_weights(self, observation: np.ndarray | torch.Tensor) -> np.ndarray | None:
         obs = _as_numpy_vector(observation, name="observation")
-        tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        model_input = self._build_model_input(obs)
+        tensor = torch.as_tensor(model_input, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.inference_mode():
             outputs = self.model.forward(tensor)
         gate = outputs.get("gate_weights") if isinstance(outputs, dict) else None
@@ -506,6 +684,8 @@ class ContinuousActorCriticAgent:
             "variant": self.variant,
             "observation_dim": self.observation_dim,
             "action_dim": self.action_dim,
+            "use_temporal_context": self._use_temporal_context,
+            "context_len": self._context_len,
             "ppo_epochs": self.ppo_epochs,
             "ppo_clip_eps": self.ppo_clip_eps,
             "gae_lambda": self.gae_lambda,
@@ -532,6 +712,8 @@ class ContinuousActorCriticAgent:
             raise ValueError("Checkpoint observation dimension does not match the current agent.")
         if int(metadata.get("action_dim", self.action_dim)) != self.action_dim:
             raise ValueError("Checkpoint action dimension does not match the current agent.")
+        if bool(metadata.get("use_temporal_context", self._use_temporal_context)) != self._use_temporal_context:
+            raise ValueError("Checkpoint temporal context setting does not match the current agent.")
 
         buffer_state = metadata.get("buffer")
         if isinstance(buffer_state, dict):
@@ -672,7 +854,7 @@ class ContinuousActorCriticAgent:
         } | {"updates": float(update_count)}
 
     def _update_sac(self) -> dict[str, float] | None:
-        assert isinstance(self.buffer, ContinuousReplayBuffer)
+        assert isinstance(self.buffer, (ContinuousReplayBuffer, ContinuousPrioritizedReplayBuffer))
         assert isinstance(self.model, (SACActorCritic, RCMoESACActorCritic))
         assert isinstance(self.target_model, (SACActorCritic, RCMoESACActorCritic))
         assert self.actor_optimizer is not None
@@ -683,6 +865,7 @@ class ContinuousActorCriticAgent:
         if len(self.buffer) < self.config.batch_size:
             return None
 
+        use_per = isinstance(self.buffer, ContinuousPrioritizedReplayBuffer)
         actor_parameters = self.model.actor_parameters()
         critic_parameters = self.model.critic_parameters()
         critic_freeze_parameters = self.model.critic_freeze_parameters()
@@ -696,10 +879,18 @@ class ContinuousActorCriticAgent:
         updates = 0
 
         for _ in range(max(int(self.config.gradient_steps), 1)):
-            observations_np, actions_np, rewards_np, next_observations_np, dones_np = self.buffer.sample(
-                self.config.batch_size,
-                self.rng,
-            )
+            if use_per:
+                observations_np, actions_np, rewards_np, next_observations_np, dones_np, is_weights_np, tree_indices = self.buffer.sample(
+                    self.config.batch_size,
+                    self.rng,
+                    beta=self.config.per_beta_start,
+                )
+                is_weights = torch.as_tensor(is_weights_np, dtype=torch.float32, device=self.device)
+            else:
+                observations_np, actions_np, rewards_np, next_observations_np, dones_np = self.buffer.sample(
+                    self.config.batch_size,
+                    self.rng,
+                )
             observations = torch.as_tensor(observations_np, dtype=torch.float32, device=self.device)
             actions = torch.as_tensor(actions_np, dtype=torch.float32, device=self.device)
             rewards = torch.as_tensor(rewards_np, dtype=torch.float32, device=self.device).unsqueeze(-1)
@@ -719,10 +910,18 @@ class ContinuousActorCriticAgent:
 
             current_q1 = self.model.q1(observations, actions)
             current_q2 = self.model.q2(observations, actions)
-            critic_loss = (
-                torch.nn.functional.mse_loss(current_q1, target_q)
-                + torch.nn.functional.mse_loss(current_q2, target_q)
-            )
+            td_error_q1 = (current_q1 - target_q).abs()
+            td_error_q2 = (current_q2 - target_q).abs()
+            if use_per:
+                critic_loss = (
+                    (td_error_q1.pow(2) * is_weights.unsqueeze(-1)).mean()
+                    + (td_error_q2.pow(2) * is_weights.unsqueeze(-1)).mean()
+                )
+            else:
+                critic_loss = (
+                    torch.nn.functional.mse_loss(current_q1, target_q)
+                    + torch.nn.functional.mse_loss(current_q2, target_q)
+                )
 
             self.critic_optimizer.zero_grad(set_to_none=True)
             critic_loss.backward()
@@ -762,6 +961,11 @@ class ContinuousActorCriticAgent:
 
             self._soft_update_target()
 
+            if use_per:
+                with torch.no_grad():
+                    raw_td = ((td_error_q1 + td_error_q2) / 2.0).squeeze(-1).cpu().numpy()
+                self.buffer.update_priorities(tree_indices, raw_td)
+
             metrics["critic_loss"] += float(critic_loss.item())
             metrics["actor_loss"] += float(actor_loss.item())
             metrics["alpha_loss"] += float(alpha_loss.item())
@@ -786,6 +990,7 @@ class ContinuousActorCriticAgent:
 
 __all__ = [
     "ContinuousActorCriticAgent",
+    "ContinuousPrioritizedReplayBuffer",
     "ContinuousReplayBuffer",
     "RolloutBuffer",
 ]
