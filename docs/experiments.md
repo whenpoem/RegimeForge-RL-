@@ -54,6 +54,7 @@ The main comparison set includes:
 - `RCMoE-DQN`
 - `RCMoE-DQN+LB`
 - `HMM+DQN`
+- `Transformer-DQN`
 - `Random`
 - `Buy&Hold`
 
@@ -73,6 +74,9 @@ What they mean:
 
 - `HMM+DQN`
   - Detector-plus-policy baseline.
+
+- `Transformer-DQN`
+  - Sequence-aware DQN that encodes a rolling observation window with a Transformer.
 
 - `Random`
   - Random action policy.
@@ -173,6 +177,10 @@ Useful flags:
 
 - `--continuous-actions`
   - Run the continuous environment path.
+
+Agent types can also be selected through config files with `agent_type`, including
+`dqn`, `oracle_dqn`, `hmm_dqn`, `rcmoe_dqn`, `transformer_dqn`, and `world_model`.
+The `world_model` agent is currently a discrete-environment research path rather than a continuous-action method.
 
 - `--parallel-workers`
   - Run specs/seeds in isolated worker artifact roots.

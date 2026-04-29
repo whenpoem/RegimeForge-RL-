@@ -6,8 +6,9 @@ The package name is `regime_lens`.
 ## What Lives Here
 
 - Synthetic and continuous market generation with hidden-regime dynamics
-- DQN, Oracle DQN, HMM+DQN, RCMoE-DQN, PPO, SAC, and continuous RCMoE implementations
+- DQN, Oracle DQN, HMM+DQN, RCMoE-DQN, Transformer-DQN, world-model, PPO, SAC, and continuous RCMoE implementations
 - Training orchestration, model checkpoints, resume state, artifact writing, and checkpoint evaluation
+- Agent observation adapters that keep train/eval/surface/explainability input shapes consistent
 - Rich terminal dashboard and FastAPI artifact dashboard
 - Experiment runner, parallel execution, robust statistics, and report generation utilities
 - Visualization and LaTeX export helpers
@@ -78,6 +79,20 @@ artifacts/
 
 Experiment bundles are written under `artifacts/_experiments/` and
 include `report.json`, `report.md`, `results.tex`, `manifest.json`, and execution records.
+
+## Agent Integration Contract
+
+`regime_lens.training` owns orchestration, not agent-specific observation wiring. New agent families
+should route their train/eval/policy-surface/explainability inputs through
+`regime_lens.agent_io.AgentObservationAdapter`.
+
+Keep these cases centralized there:
+
+- true-regime one-hot inputs for Oracle agents
+- HMM/GMM posterior augmentation
+- temporal RCMoE flattened context windows
+- Transformer flattened observation sequences
+- neutral surface/explainability observations used outside live rollouts
 
 ## Packaging Notes
 

@@ -8,7 +8,7 @@ RegimeForge is a regime-aware reinforcement learning workbench for trading resea
 It combines:
 
 1. Configurable market environments with hidden regime dynamics.
-2. Discrete and continuous trading agents, including gated mixture-of-experts models.
+2. Discrete and continuous trading agents, including gated mixture-of-experts, Transformer, and world-model variants.
 3. A training and evaluation pipeline that writes structured artifacts for analysis and resume.
 4. TUI, Web, experiment runner, and report tooling built on the same artifact layout.
 
@@ -63,8 +63,16 @@ RegimeForge supports these discrete agent types, defined in `backend/regime_lens
 
 - `hmm_dqn`
   - Two-stage baseline.
-  - Uses a lightweight Gaussian mixture detector as the current HMM-style proxy baseline.
+  - Uses `hmmlearn` when available and falls back to a lightweight Gaussian mixture detector.
   - Feeds inferred regime probabilities to a DQN policy.
+
+- `transformer_dqn`
+  - DQN over a flattened history window.
+  - The Transformer encoder handles temporal dependencies without changing the environment API.
+
+- `world_model`
+  - Dreamer-style experimental agent.
+  - Learns RSSM latent dynamics, reconstructs observations, predicts reward, and trains actor/critic on imagined rollouts.
 
 The discrete action space is:
 
@@ -76,6 +84,25 @@ Continuous experiments use `PPO`, `SAC`, and gated RCMoE actor-critic variants o
 weights. The same experiment runner can execute discrete or continuous smoke, benchmark, ablation,
 and OOD suites.
 
+## Agent observation boundary
+
+The highest-risk architectural seam is the translation from environment observations into each
+agent's model input. RegimeForge keeps that contract in `backend/regime_lens/agent_io.py` through
+`AgentObservationAdapter`.
+
+This adapter owns:
+
+- Oracle one-hot augmentation.
+- HMM/GMM posterior augmentation.
+- Temporal RCMoE context windows.
+- Transformer sequence flattening for policy surfaces and explainability.
+- Continuous Oracle/HMM observation shaping.
+- Per-episode detector fitting and context reset.
+
+Training, checkpoint evaluation, policy-surface generation, and explainability should use the
+adapter rather than duplicating shape logic. That keeps new agent families from silently working in
+training but failing in evaluation or reports.
+
 ## Training pipeline
 
 Training lives in `backend/regime_lens/training.py` and is orchestrated by `TrainingManager`.
@@ -85,9 +112,10 @@ The pipeline is:
 1. Create a new run directory and persist the initial summary.
 2. Configure runtime settings such as device, CPU threads, and process priority.
 3. Instantiate the selected environment and agent.
-4. Roll out episodes, collect rewards, losses, and per-step trading statistics.
-5. Flush metrics and checkpoint artifacts at configured intervals.
-6. Evaluate checkpoints and write analysis bundles for later inspection.
+4. Create an `AgentObservationAdapter` for the selected agent/environment contract.
+5. Roll out episodes, collect rewards, losses, and per-step trading statistics.
+6. Flush metrics and checkpoint artifacts at configured intervals.
+7. Evaluate checkpoints and write analysis bundles for later inspection.
 
 The runtime also exposes live telemetry for the TUI, including:
 

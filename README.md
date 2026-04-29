@@ -23,8 +23,9 @@ To make that inspectable, the project focuses on three things:
 
 - Synthetic hidden-regime market environments with configurable transition matrices and per-regime dynamics
 - Semi-realistic data mode that fits regime parameters from local price CSVs and injects them into training configs
-- Discrete agent variants: vanilla DQN, Oracle DQN, HMM+DQN, and RCMoE-DQN
+- Discrete agent variants: vanilla DQN, Oracle DQN, HMM+DQN, RCMoE-DQN, and Transformer-DQN
 - Continuous actor-critic variants for PPO, SAC, and gated RCMoE actor-critic experiments
+- Dreamer-style world-model experiments with RSSM dynamics and latent-space actor/critic training
 - Multi-asset and non-stationary continuous market paths for robustness checks
 - Terminal dashboard and FastAPI artifact dashboard for inspecting runs and checkpoints
 - Experiment runner for smoke tests, full benchmarks, ablations, OOD sweeps, parallel execution, and report rebuilds
@@ -50,6 +51,8 @@ flowchart LR
 - `oracle_dqn`: upper-bound baseline with true regime one-hot appended to observations
 - `hmm_dqn`: lightweight GMM detector plus DQN policy, used as the current HMM-style proxy baseline
 - `rcmoe_dqn`: regime-conditioned mixture-of-experts DQN with gate routing and expert specialization analysis
+- `transformer_dqn`: DQN with a Transformer encoder over flattened observation histories
+- `world_model`: Dreamer-style latent dynamics agent for discrete market experiments
 - `ppo`: continuous actor-critic policy over allocation weights
 - `sac`: off-policy continuous actor-critic policy over allocation weights
 - `rcmoe` actor-critic: gated expert actor-critic path for continuous PPO/SAC variants
@@ -88,11 +91,14 @@ RL/
 |-- backend/
 |   |-- regime_lens/
 |   |   |-- config.py
+|   |   |-- agent_io.py
 |   |   |-- market.py
 |   |   |-- dqn.py
 |   |   |-- oracle_dqn.py
 |   |   |-- hmm_dqn.py
 |   |   |-- rcmoe.py
+|   |   |-- transformer_agent.py
+|   |   |-- world_model.py
 |   |   |-- training.py
 |   |   |-- tui.py
 |   |   |-- web.py
@@ -177,6 +183,7 @@ D:\miniconda\envs\statshell\python.exe -m regime_lens.run_experiments run --suit
 ## Engineering Notes
 
 - The repository is artifact-first. TUI, Web dashboard, reports, and visualization helpers all read the same run/checkpoint layout.
+- Agent-specific observation shaping lives in `backend/regime_lens/agent_io.py`; train, eval, policy-surface, and explainability paths should go through that adapter instead of open-coding Oracle/HMM/context transforms.
 - The PowerShell launcher is Windows-oriented, but the Python package entry points are usable directly.
 - Artifact directories are intentionally excluded from version control.
 
