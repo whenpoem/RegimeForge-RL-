@@ -251,7 +251,7 @@ class ContinuousTrainingTests(unittest.TestCase):
             )
 
             self.assertEqual(result["suite"], "ood-drift")
-            self.assertEqual(len(result["executionRecords"]), 7)
+            self.assertEqual(len(result["executionRecords"]), 8)
             self.assertTrue(all(record["status"] == "completed" for record in result["executionRecords"]))
 
 

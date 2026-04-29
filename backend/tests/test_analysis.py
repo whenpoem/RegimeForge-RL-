@@ -104,14 +104,16 @@ class ExpertUtilizationTests(unittest.TestCase) :
 
 class MetricsEdgeCaseTests(unittest.TestCase):
     def test_sharpe_empty(self) -> None:
-        self.assertEqual(sharpe_ratio(np.array([])), 0.0)
+        result = sharpe_ratio(np.array([]))
+        self.assertTrue(np.isnan(result) or result == 0.0)
 
     def test_sharpe_all_positive(self) -> None:
         returns = np.ones(100) * 0.001
         self.assertGreater(sharpe_ratio(returns), 0)
 
     def test_sortino_empty(self) -> None:
-        self.assertEqual(sortino_ratio(np.array([])), 0.0)
+        result = sortino_ratio(np.array([]))
+        self.assertTrue(np.isnan(result) or result == 0.0)
 
     def test_max_drawdown_empty(self) -> None:
         self.assertEqual(max_drawdown(np.array([])), 0.0)

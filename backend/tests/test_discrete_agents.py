@@ -173,8 +173,9 @@ class RCMoEAgentTests(unittest.TestCase):
         self.assertIsNotNone(loss)
 
     def test_temporal_gate(self) -> None:
+        # For temporal gate, observation_dim = base_dim * context_len = 7 * 4 = 28
         agent = RCMoEAgent(
-            observation_dim=7, action_dim=3, hidden_dim=16,
+            observation_dim=28, action_dim=3, hidden_dim=16,
             n_experts=3, gate_hidden_dim=8,
             load_balance_weight=0.01,
             learning_rate=1e-3, gamma=0.99, tau=0.01,
@@ -182,7 +183,6 @@ class RCMoEAgentTests(unittest.TestCase):
             device="cpu", seed=42,
             gate_type=GateType.TEMPORAL, context_len=4,
         )
-        # Temporal gate expects flattened context: 7 * 4 = 28
         context = np.random.default_rng(42).standard_normal(28).astype(np.float32)
         weights = agent.gate_weights(context)
         self.assertEqual(weights.shape, (3,))

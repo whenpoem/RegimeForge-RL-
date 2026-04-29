@@ -25,7 +25,7 @@ class SyntheticMarketEnvTests(unittest.TestCase):
         env = SyntheticMarketEnv(config)
         state = env.reset(seed=42)
         self.assertEqual(state.shape, (7,))
-        self.assertEqual(len(env.prices), 50 + 10 + 1)
+        self.assertEqual(len(env.prices), 50 + 10 + 2)  # returns + initial price
         self.assertEqual(len(env.regimes), 50 + 10 + 1)
 
     def test_different_seeds_different_trajectories(self) -> None:
@@ -64,7 +64,8 @@ class SyntheticMarketEnvTests(unittest.TestCase):
         )
         env = SyntheticMarketEnv(config)
         env.reset(seed=42)
-        state, reward, done, info = env.step(1)  # long
+        # ACTION_VALUES = (-1, 0, 1) → step(2) = long
+        state, reward, done, info = env.step(2)  # long
         self.assertEqual(env.position, 1)
         self.assertFalse(done)
         self.assertIn("regime", info)
