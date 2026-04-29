@@ -129,44 +129,82 @@ class TransformerDQNAgent:
         else:
             self.buffer = ReplayBuffer(replay_capacity, observation_dim * seq_len)
         self._context_history: Deque[np.ndarray] | None = None
+        self._last_state: np.ndarray | None = None
+        self._last_context: np.ndarray | None = None
 
     def reset_context(self) -> None:
         self._context_history = None
+        self._last_state = None
+        self._last_context = None
 
-    def _build_context(self, state: np.ndarray) -> np.ndarray:
+    def _coerce_state(self, state: np.ndarray) -> np.ndarray:
+        array = np.asarray(state, dtype=np.float32).reshape(-1)
+        if array.shape[0] != self.observation_dim:
+            raise ValueError("State shape does not match the configured observation_dim.")
+        return array
+
+    def _same_state(self, state: np.ndarray) -> bool:
+        return self._last_state is not None and self._last_state.shape == state.shape and np.array_equal(self._last_state, state)
+
+    def _build_context(self, state: np.ndarray, *, advance: bool = False) -> np.ndarray:
+        state_array = self._coerce_state(state)
         if self._context_history is None:
-            self._context_history = initialise_context_history(state, context_len=self.seq_len)
+            history = initialise_context_history(state_array, context_len=self.seq_len)
+        elif advance:
+            history = append_context_state(self._context_history, state_array)
+        elif self._same_state(state_array) and self._last_context is not None:
+            return self._last_context.copy()
         else:
-            self._context_history = append_context_state(self._context_history, state)
-        return build_temporal_context(self._context_history, context_len=self.seq_len)
+            history = append_context_state(self._context_history, state_array)
+
+        context = build_temporal_context(history, context_len=self.seq_len)
+        if advance:
+            self._context_history = history
+            self._last_state = state_array.copy()
+            self._last_context = context.copy()
+        return context
 
     def select_action(self, state: np.ndarray, epsilon: float) -> int:
+        ctx = self._build_context(state, advance=True)
         if self.rng.random() < epsilon:
             return int(self.rng.integers(0, self.action_dim))
-        return self.greedy_action(state)
+        return self._greedy_from_context(ctx)
 
     def greedy_action(self, state: np.ndarray) -> int:
-        ctx = self._build_context(state)
-        tensor = torch.as_tensor(ctx, dtype=torch.float32, device=self.device).unsqueeze(0)
+        ctx = self._build_context(state, advance=True)
+        return self._greedy_from_context(ctx)
+
+    def _greedy_from_context(self, context: np.ndarray) -> int:
+        tensor = torch.as_tensor(context, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.inference_mode():
             q = self.online(tensor)
         return int(torch.argmax(q, dim=1).item())
 
     def q_values(self, state: np.ndarray) -> np.ndarray:
-        ctx = self._build_context(state)
+        ctx = self._build_context(state, advance=False)
         tensor = torch.as_tensor(ctx, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.inference_mode():
             q = self.online(tensor)
         return q.squeeze(0).cpu().numpy().astype(np.float64)
 
+    def batch_q_values(self, states: np.ndarray) -> np.ndarray:
+        states_array = np.asarray(states, dtype=np.float32)
+        if states_array.ndim != 2 or states_array.shape[1] != self.observation_dim * self.seq_len:
+            raise ValueError("Transformer batch_q_values expects flattened temporal contexts.")
+        tensor = torch.as_tensor(states_array, dtype=torch.float32, device=self.device)
+        with torch.inference_mode():
+            q = self.online(tensor)
+        return q.cpu().numpy().astype(np.float64, copy=False)
+
     def store(self, state: np.ndarray, action: int, reward: float,
               next_state: np.ndarray, done: bool) -> None:
-        ctx = self._build_context(state)
+        ctx = self._build_context(state, advance=False)
+        next_ctx = self._build_context(next_state, advance=False)
         self.buffer.add(
             np.asarray(ctx, dtype=np.float32),
             int(action),
             float(reward),
-            np.asarray(ctx, dtype=np.float32),  # next context will be built during update
+            np.asarray(next_ctx, dtype=np.float32),
             bool(done),
         )
 
@@ -213,11 +251,20 @@ class TransformerDQNAgent:
         return float(loss.item())
 
     def hidden_activations(self, state: np.ndarray) -> np.ndarray:
-        ctx = self._build_context(state)
+        ctx = self._build_context(state, advance=False)
         tensor = torch.as_tensor(ctx, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.inference_mode():
             hidden = self.online.hidden(tensor)
         return hidden.squeeze(0).cpu().numpy().astype(np.float64)
+
+    def batch_hidden_activations(self, states: np.ndarray) -> np.ndarray:
+        states_array = np.asarray(states, dtype=np.float32)
+        if states_array.ndim != 2 or states_array.shape[1] != self.observation_dim * self.seq_len:
+            raise ValueError("Transformer batch_hidden_activations expects flattened temporal contexts.")
+        tensor = torch.as_tensor(states_array, dtype=torch.float32, device=self.device)
+        with torch.inference_mode():
+            hidden = self.online.hidden(tensor)
+        return hidden.cpu().numpy().astype(np.float64, copy=False)
 
     def save_checkpoint(self, directory: str | Path) -> None:
         d = Path(directory)

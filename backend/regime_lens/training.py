@@ -191,6 +191,32 @@ def _is_continuous_config(config: TrainingConfig) -> bool:
     return bool(config.continuous_actions or config.algorithm != AlgorithmType.DQN)
 
 
+def _reset_agent_context(agent: object) -> None:
+    reset = getattr(agent, "reset_context", None)
+    if callable(reset):
+        reset()
+
+
+def _continuous_agent_observation(config: TrainingConfig, agent: object, env: Any, state: np.ndarray) -> np.ndarray:
+    if config.agent_type == AgentType.ORACLE_DQN:
+        return env.observe_oracle().state
+    if _is_hmm_continuous(agent):
+        recent_returns = env.returns[max(0, env.t - 10) : env.t]
+        return agent.augment_state(state, recent_returns)
+    return state
+
+
+def _continuous_surface_agent_observation(config: TrainingConfig, agent: object, state: np.ndarray) -> np.ndarray:
+    if config.agent_type == AgentType.ORACLE_DQN:
+        uniform = np.full(len(REGIME_LABELS), 1.0 / len(REGIME_LABELS), dtype=np.float32)
+        return np.concatenate([state, uniform]).astype(np.float32)
+    if _is_hmm_continuous(agent):
+        n_components = int(getattr(agent, "_n_components", len(REGIME_LABELS)))
+        uniform = np.full(n_components, 1.0 / n_components, dtype=np.float32)
+        return np.concatenate([state, uniform]).astype(np.float32)
+    return state
+
+
 def _uses_temporal_gate(config: TrainingConfig, agent: object) -> bool:
     return _is_rcmoe(agent) and config.gate_type == GateType.TEMPORAL
 
@@ -254,12 +280,16 @@ def _representative_trace_state(episode_payload: dict[str, Any]) -> tuple[int, n
 
 
 def _build_explainability_state(config: TrainingConfig, agent: object, base_state: np.ndarray) -> np.ndarray:
-    if _is_oracle(agent):
+    if _is_oracle(agent) or config.agent_type == AgentType.ORACLE_DQN:
         neutral_regime = np.full(len(REGIME_LABELS), 1.0 / len(REGIME_LABELS), dtype=np.float32)
         return np.concatenate([base_state, neutral_regime]).astype(np.float32)
-    if _is_hmm(agent):
-        neutral_posterior = np.full(agent._n_components, 1.0 / agent._n_components, dtype=np.float32)
+    if _is_hmm(agent) or _is_hmm_continuous(agent):
+        n_components = int(getattr(agent, "_n_components", len(REGIME_LABELS)))
+        neutral_posterior = np.full(n_components, 1.0 / n_components, dtype=np.float32)
         return np.concatenate([base_state, neutral_posterior]).astype(np.float32)
+    if _is_transformer(agent):
+        seq_len = max(int(getattr(agent, "seq_len", config.seq_len)), 1)
+        return np.tile(base_state, seq_len).astype(np.float32)
     if _is_rcmoe(agent) and getattr(agent, "gate_type", config.gate_type) == GateType.TEMPORAL:
         context_len = max(int(getattr(agent, "context_len", config.context_len)), 1)
         return np.tile(base_state, context_len).astype(np.float32)
@@ -605,7 +635,14 @@ class TrainingManager:
     ) -> tuple[Any, DQNAgent | RCMoEAgent | OracleDQNAgent | HMMDQNAgent | ContinuousActorCriticAgent]:
         env = _build_env(config)
         agent_kwargs: dict[str, int] = {}
-        if _is_continuous_config(config):
+        if config.agent_type == AgentType.WORLD_MODEL:
+            if _is_continuous_config(config):
+                raise ValueError("World model agent currently supports the discrete market environment only.")
+            agent_kwargs = {
+                "observation_dim": int(config.observation_dim),
+                "action_dim": 1,
+            }
+        elif _is_continuous_config(config):
             agent_kwargs = {
                 "observation_dim": int(env.observation_dim),
                 "action_dim": int(env.action_dim),
@@ -1113,6 +1150,7 @@ class TrainingManager:
                 step_regimes: list[str] = []
                 net_exposures: list[float] = []
                 gross_exposures: list[float] = []
+                last_agent_observation: np.ndarray | None = None
 
                 is_oracle_continuous = config.agent_type == AgentType.ORACLE_DQN
                 is_hmm_continuous = _is_hmm_continuous(agent)
@@ -1129,6 +1167,7 @@ class TrainingManager:
                         obs_for_agent = agent.augment_state(state, recent_ret)
                     else:
                         obs_for_agent = state
+                    last_agent_observation = obs_for_agent
                     action_info = agent.act(obs_for_agent, deterministic=False)
                     action = np.asarray(action_info["action"], dtype=np.float32).reshape(-1)
                     next_state, reward, done, info = env.step(action)
@@ -1227,7 +1266,7 @@ class TrainingManager:
                     "maxDrawdown": fin_metrics.get("max_drawdown"),
                     "winRate": fin_metrics.get("win_rate"),
                 }
-                if agent.gate_weights(state) is not None:
+                if last_agent_observation is not None and agent.gate_weights(last_agent_observation) is not None:
                     metric_entry["gateAccuracy"] = self.live_gate_accuracy
                 metrics_series.append(metric_entry)
                 tracker.log_episode(episode, metric_entry)
@@ -1591,7 +1630,9 @@ class TrainingManager:
     ) -> dict[str, Any]:
         env = _build_env(config)
         state = env.reset(seed=seed)
-        is_oracle = config.agent_type == AgentType.ORACLE_DQN
+        if _is_hmm_continuous(agent):
+            agent.fit_detector(env.returns[:config.warmup_steps])
+        _reset_agent_context(agent)
         done = False
         step = 0
         cumulative_reward = 0.0
@@ -1606,7 +1647,7 @@ class TrainingManager:
 
         while not done:
             view = env.observe()
-            obs_for_policy = env.observe_oracle().state if is_oracle else state
+            obs_for_policy = _continuous_agent_observation(config, agent, env, state)
             action = np.asarray(policy(obs_for_policy, step), dtype=np.float32).reshape(-1)
             next_state, reward, done, info = env.step(action)
             positions = np.asarray(info.get("positions", action), dtype=np.float32).reshape(-1)
@@ -1687,16 +1728,19 @@ class TrainingManager:
         for volatility in vol_axis:
             for trend in trend_axis:
                 state = _continuous_surface_state(surface_env, trend_gap_pct=float(trend), volatility_pct=float(volatility))
-                action = np.asarray(agent.act(state, deterministic=True)["action"], dtype=np.float32).reshape(-1)
+                agent_state = _continuous_surface_agent_observation(config, agent, state)
+                _reset_agent_context(agent)
+                action = np.asarray(agent.act(agent_state, deterministic=True)["action"], dtype=np.float32).reshape(-1)
                 cell: dict[str, Any] = {
                     "trendGapPct": float(trend),
                     "volatilityPct": float(volatility),
                     "action": action.tolist() if action.size > 1 else float(action[0]),
                 }
-                gate_weights = agent.gate_weights(state)
+                gate_weights = agent.gate_weights(agent_state)
                 if gate_weights is not None:
                     cell["gateWeights"] = gate_weights.tolist()
                 cells.append(cell)
+        _reset_agent_context(agent)
 
         return {
             "checkpointId": checkpoint_id,
@@ -1952,6 +1996,7 @@ class TrainingManager:
         initial_state = env.reset(seed=seed)
         if _is_hmm(agent):
             agent.fit_detector(env.returns[:config.warmup_steps])
+        _reset_agent_context(agent)
 
         uses_temporal_gate = _is_rcmoe(agent) and getattr(agent, "gate_type", config.gate_type) == GateType.TEMPORAL
         context_len = max(int(getattr(agent, "context_len", config.context_len)), 1)
@@ -2070,6 +2115,9 @@ class TrainingManager:
         elif _is_hmm(agent):
             uniform = np.full(agent._n_components, 1.0 / agent._n_components, dtype=np.float32)
             states = np.asarray([np.concatenate([state, uniform]) for state in states], dtype=np.float32)
+        elif _is_transformer(agent):
+            seq_len = max(int(getattr(agent, "seq_len", config.seq_len)), 1)
+            states = np.asarray([np.tile(state, seq_len) for state in states], dtype=np.float32)
         elif uses_temporal_gate:
             states = np.asarray([np.tile(state, context_len) for state in states], dtype=np.float32)
 

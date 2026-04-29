@@ -263,10 +263,8 @@ class RCMoEActorCritic(nn.Module):
         self.gate_type = gate_type
         self.context_len = context_len
         self._use_temporal = gate_type == GateType.TEMPORAL and not hierarchical_moe
-        # Gate input: temporal context is flattened, otherwise single observation
-        gate_input_dim = observation_dim * context_len if self._use_temporal else observation_dim
         self.gate = _build_gate(
-            gate_input_dim, n_experts, gate_hidden_dim,
+            observation_dim, n_experts, gate_hidden_dim,
             gate_type=gate_type, context_len=context_len,
             hierarchical_moe=hierarchical_moe, macro_experts=macro_experts,
         )
@@ -378,9 +376,8 @@ class RCMoESACActorCritic(nn.Module):
         self.gate_type = gate_type
         self.context_len = context_len
         self._use_temporal = gate_type == GateType.TEMPORAL and not hierarchical_moe
-        gate_input_dim = observation_dim * context_len if self._use_temporal else observation_dim
         self.gate = _build_gate(
-            gate_input_dim, n_experts, gate_hidden_dim,
+            observation_dim, n_experts, gate_hidden_dim,
             gate_type=gate_type, context_len=context_len,
             hierarchical_moe=hierarchical_moe, macro_experts=macro_experts,
         )

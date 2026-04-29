@@ -404,16 +404,15 @@ class WorldModelAgent:
         # Actor loss: maximize expected returns
         actor_loss = -returns.mean()
 
-        # Critic loss: predict returns
-        critic_pred = values[:-1]
-        critic_loss = nn.functional.mse_loss(critic_pred, returns.detach())
-
         self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward(retain_graph=True)
+        actor_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
 
+        self.world_optimizer.zero_grad(set_to_none=True)
         self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_pred = self.critic(latents[:-1].detach())
+        critic_loss = nn.functional.mse_loss(critic_pred, returns.detach())
         critic_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()

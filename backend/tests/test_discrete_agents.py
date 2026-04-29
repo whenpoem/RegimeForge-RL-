@@ -24,6 +24,7 @@ from backend.regime_lens.dqn import (
 from backend.regime_lens.hmm_dqn import HMMDQNAgent, RegimeDetector
 from backend.regime_lens.oracle_dqn import OracleDQNAgent
 from backend.regime_lens.rcmoe import RCMoEAgent
+from backend.regime_lens.transformer_agent import TransformerDQNAgent
 
 
 class ReplayBufferTests(unittest.TestCase):
@@ -263,6 +264,43 @@ class HMMDQNAgentTests(unittest.TestCase):
             restored.load_checkpoint(ckpt, weights_only=False)
             restored_state = restored.augment_state(base, returns[-10:])
             np.testing.assert_allclose(restored_state, expected)
+
+
+class TransformerDQNAgentTests(unittest.TestCase):
+    def test_context_queries_do_not_mutate_replay_contexts(self) -> None:
+        agent = TransformerDQNAgent(
+            observation_dim=2,
+            action_dim=3,
+            hidden_dim=16,
+            learning_rate=1e-3,
+            gamma=0.99,
+            tau=0.01,
+            replay_capacity=8,
+            batch_size=2,
+            device="cpu",
+            seed=42,
+            n_heads=2,
+            n_layers=1,
+            seq_len=3,
+            dropout=0.0,
+        )
+        first = np.array([0.1, -0.2], dtype=np.float32)
+        second = np.array([0.3, 0.4], dtype=np.float32)
+
+        action = agent.select_action(first, epsilon=1.0)
+        context_before_query = [item.copy() for item in agent._context_history]
+        _ = agent.q_values(first)
+        _ = agent.hidden_activations(first)
+        context_after_query = [item.copy() for item in agent._context_history]
+
+        for before, after in zip(context_before_query, context_after_query, strict=True):
+            np.testing.assert_allclose(before, after)
+
+        agent.store(first, action, reward=0.5, next_state=second, done=False)
+        np.testing.assert_allclose(agent.buffer.states[0], np.tile(first, 3))
+        np.testing.assert_allclose(agent.buffer.next_states[0], np.concatenate([first, first, second]))
+        q_values = agent.batch_q_values(np.stack([agent.buffer.states[0], agent.buffer.next_states[0]]))
+        self.assertEqual(q_values.shape, (2, 3))
 
 
 if __name__ == "__main__":

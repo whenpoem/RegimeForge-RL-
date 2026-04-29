@@ -333,6 +333,10 @@ class HMMContinuousAgent:
         return self.agent.action_dim
 
     @property
+    def model(self) -> Any:
+        return self.agent.model
+
+    @property
     def buffer(self) -> Any:
         return self.agent.buffer
 

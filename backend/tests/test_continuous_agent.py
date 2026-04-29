@@ -21,7 +21,7 @@ try:
         RCMoESACActorCritic,
         SACActorCritic,
     )
-    from backend.regime_lens.config import AgentType, AlgorithmType, TrainingConfig
+    from backend.regime_lens.config import AgentType, AlgorithmType, GateType, TrainingConfig
     from backend.regime_lens.continuous_agent import ContinuousActorCriticAgent
 except ModuleNotFoundError:
     from regime_lens.actor_critic import (
@@ -30,7 +30,7 @@ except ModuleNotFoundError:
         RCMoESACActorCritic,
         SACActorCritic,
     )
-    from regime_lens.config import AgentType, AlgorithmType, TrainingConfig
+    from regime_lens.config import AgentType, AlgorithmType, GateType, TrainingConfig
     from regime_lens.continuous_agent import ContinuousActorCriticAgent
 
 
@@ -216,6 +216,39 @@ class ContinuousActorCriticAgentTests(unittest.TestCase):
         assert gate_weights is not None
         self.assertEqual(gate_weights.shape, (3,))
         self.assertAlmostEqual(float(gate_weights.sum()), 1.0, places=5)
+
+    def test_temporal_rcmoe_stores_contexts_without_query_side_effects(self) -> None:
+        config = TrainingConfig(
+            algorithm=AlgorithmType.SAC,
+            agent_type=AgentType.RCMOE_DQN,
+            gate_type=GateType.TEMPORAL,
+            context_len=3,
+            device="cpu",
+            autostart=False,
+            batch_size=2,
+            replay_capacity=8,
+            hidden_dim=16,
+            gate_hidden_dim=8,
+            n_experts=2,
+            seed=31,
+        )
+        agent = ContinuousActorCriticAgent(config, observation_dim=2, action_dim=1)
+        first = np.array([0.1, -0.2], dtype=np.float32)
+        second = np.array([0.3, 0.4], dtype=np.float32)
+
+        action = agent.act(first, deterministic=True)["action"]
+        context_before_query = [item.copy() for item in agent._context_history]
+        gate_weights = agent.gate_weights(first)
+        context_after_query = [item.copy() for item in agent._context_history]
+
+        self.assertIsNotNone(gate_weights)
+        for before, after in zip(context_before_query, context_after_query, strict=True):
+            np.testing.assert_allclose(before, after)
+
+        agent.store(first, action, reward=0.2, next_observation=second, done=False)
+        assert hasattr(agent.buffer, "observations")
+        np.testing.assert_allclose(agent.buffer.observations[0], np.tile(first, 3))
+        np.testing.assert_allclose(agent.buffer.next_observations[0], np.concatenate([first, first, second]))
 
 
 if __name__ == "__main__":

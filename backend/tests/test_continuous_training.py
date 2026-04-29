@@ -10,6 +10,60 @@ from backend.regime_lens.training import TrainingManager
 
 
 class ContinuousTrainingTests(unittest.TestCase):
+    def test_training_manager_world_model_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = TrainingConfig(
+                artifact_root=Path(tmp) / "artifacts",
+                agent_type=AgentType.WORLD_MODEL,
+                device="cpu",
+                autostart=False,
+                episodes=1,
+                episode_length=6,
+                warmup_steps=4,
+                hidden_dim=16,
+                latent_dim=8,
+                recurrent_dim=16,
+                imag_horizon=3,
+                seed=37,
+            )
+            manager = TrainingManager(config)
+            _, agent = manager._build_env_and_agent(config, "cpu")
+
+            self.assertEqual(agent.action_dim, 1)
+            run_id = manager.run_new_run_blocking()
+            summary = manager.store.read_run_summary(run_id)
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(summary["latestCheckpointId"], "ckpt-0001")
+
+    def test_training_manager_transformer_dqn_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = TrainingConfig(
+                artifact_root=Path(tmp) / "artifacts",
+                agent_type=AgentType.TRANSFORMER_DQN,
+                device="cpu",
+                autostart=False,
+                episodes=1,
+                episode_length=8,
+                warmup_steps=4,
+                checkpoint_interval=1,
+                metrics_flush_interval=1,
+                evaluation_episodes=1,
+                batch_size=4,
+                replay_capacity=32,
+                hidden_dim=24,
+                n_heads=2,
+                n_layers=1,
+                seq_len=3,
+                dropout=0.0,
+                seed=39,
+                fixed_eval_seeds=(9001,),
+            )
+            manager = TrainingManager(config)
+            run_id = manager.run_new_run_blocking()
+            summary = manager.store.read_run_summary(run_id)
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(summary["latestCheckpointId"], "ckpt-0001")
+
     def test_training_manager_continuous_ppo_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_root = Path(tmp) / "artifacts"

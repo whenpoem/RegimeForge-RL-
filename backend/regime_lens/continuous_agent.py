@@ -434,7 +434,10 @@ class ContinuousActorCriticAgent:
             and not config.hierarchical_moe
         )
         self._context_len = max(config.context_len, 1)
+        self._model_observation_dim = observation_dim * self._context_len if self._use_temporal_context else observation_dim
         self._context_history: Any = None  # Deque, initialised on first act()
+        self._last_raw_observation: np.ndarray | None = None
+        self._last_model_input: np.ndarray | None = None
 
         self.model = build_actor_critic(
             config,
@@ -455,7 +458,7 @@ class ContinuousActorCriticAgent:
             if not isinstance(self.model, (PPOActorCritic, RCMoEActorCritic)):
                 raise ValueError("PPO continuous agent requires a PPO-style actor-critic.")
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
-            self.buffer = RolloutBuffer(observation_dim, action_dim)
+            self.buffer = RolloutBuffer(self._model_observation_dim, action_dim)
         else:
             if not isinstance(self.model, (SACActorCritic, RCMoESACActorCritic)):
                 raise ValueError("SAC continuous agent requires the SAC actor-critic model.")
@@ -473,29 +476,51 @@ class ContinuousActorCriticAgent:
                 parameter.requires_grad_(False)
             if config.use_per:
                 self.buffer = ContinuousPrioritizedReplayBuffer(
-                    config.replay_capacity, observation_dim, action_dim,
+                    config.replay_capacity, self._model_observation_dim, action_dim,
                     alpha=config.per_alpha, epsilon=config.per_epsilon,
                 )
             else:
-                self.buffer = ContinuousReplayBuffer(config.replay_capacity, observation_dim, action_dim)
+                self.buffer = ContinuousReplayBuffer(config.replay_capacity, self._model_observation_dim, action_dim)
 
-    def _build_model_input(self, observation: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
-        """Build the input for the model, handling temporal context if needed."""
+    def _coerce_observation(self, observation: np.ndarray | torch.Tensor, *, name: str) -> np.ndarray:
+        obs = _as_numpy_vector(observation, name=name)
+        if obs.shape[0] != self.observation_dim:
+            raise ValueError(f"{name.replace('_', ' ').capitalize()} shape does not match the configured observation_dim.")
+        return obs
+
+    def _same_observation(self, left: np.ndarray | None, right: np.ndarray) -> bool:
+        return left is not None and left.shape == right.shape and np.array_equal(left, right)
+
+    def _build_temporal_input(self, observation: np.ndarray, *, advance: bool) -> np.ndarray:
+        if self._context_history is None:
+            history = initialise_context_history(observation, context_len=self._context_len)
+        elif advance:
+            history = append_context_state(self._context_history, observation)
+        elif self._same_observation(self._last_raw_observation, observation) and self._last_model_input is not None:
+            return self._last_model_input.copy()
+        else:
+            history = append_context_state(self._context_history, observation)
+
+        context = build_temporal_context(history, context_len=self._context_len)
+        if advance:
+            self._context_history = history
+            self._last_raw_observation = observation.copy()
+            self._last_model_input = context.copy()
+        return context
+
+    def _build_model_input(self, observation: np.ndarray | torch.Tensor, *, advance: bool = False) -> np.ndarray | torch.Tensor:
+        """Build the model input, optionally advancing temporal context."""
         if not self._use_temporal_context:
             return observation
-        raw = observation if isinstance(observation, np.ndarray) else observation.detach().cpu().numpy()
-        if self._context_history is None:
-            self._context_history = initialise_context_history(raw, context_len=self._context_len)
-        else:
-            self._context_history = append_context_state(self._context_history, raw)
-        return build_temporal_context(self._context_history, context_len=self._context_len)
+        raw = self._coerce_observation(observation, name="observation")
+        return self._build_temporal_input(raw, advance=advance)
 
     def act(
         self,
         observation: np.ndarray | torch.Tensor,
         deterministic: bool = False,
     ) -> dict[str, np.ndarray | torch.Tensor]:
-        model_input = self._build_model_input(observation)
+        model_input = self._build_model_input(observation, advance=True)
         with torch.inference_mode():
             outputs = self.model.act(model_input, deterministic=deterministic)
         if isinstance(observation, torch.Tensor):
@@ -519,22 +544,21 @@ class ContinuousActorCriticAgent:
         log_prob: float | np.ndarray | torch.Tensor | None = None,
         value: float | np.ndarray | torch.Tensor | None = None,
     ) -> None:
-        observation_array = _as_numpy_vector(observation, name="observation")
+        observation_array = self._coerce_observation(observation, name="observation")
         action_array = _as_numpy_vector(action, name="action")
-        next_observation_array = _as_numpy_vector(next_observation, name="next_observation")
+        next_observation_array = self._coerce_observation(next_observation, name="next_observation")
 
-        if observation_array.shape[0] != self.observation_dim:
-            raise ValueError("Observation shape does not match the configured observation_dim.")
-        if next_observation_array.shape[0] != self.observation_dim:
-            raise ValueError("Next observation shape does not match the configured observation_dim.")
         if action_array.shape[0] != self.action_dim:
             raise ValueError("Action shape does not match the configured action_dim.")
+
+        model_observation = np.asarray(self._build_model_input(observation_array, advance=False), dtype=np.float32)
+        model_next_observation = np.asarray(self._build_model_input(next_observation_array, advance=False), dtype=np.float32)
 
         if self.algorithm == AlgorithmType.PPO:
             if log_prob is None or value is None:
                 with torch.inference_mode():
                     evaluation = self.model.evaluate_actions(
-                        torch.as_tensor(observation_array, dtype=torch.float32, device=self.device).unsqueeze(0),
+                        torch.as_tensor(model_observation, dtype=torch.float32, device=self.device).unsqueeze(0),
                         torch.as_tensor(action_array, dtype=torch.float32, device=self.device).unsqueeze(0),
                     )
                 if log_prob is None:
@@ -543,10 +567,10 @@ class ContinuousActorCriticAgent:
                     value = evaluation["value"]
             assert isinstance(self.buffer, RolloutBuffer)
             self.buffer.add(
-                observation_array,
+                model_observation,
                 action_array,
                 float(reward),
-                next_observation_array,
+                model_next_observation,
                 bool(done),
                 _as_float(log_prob, name="log_prob"),
                 _as_float(value, name="value"),
@@ -555,10 +579,10 @@ class ContinuousActorCriticAgent:
 
         assert isinstance(self.buffer, (ContinuousReplayBuffer, ContinuousPrioritizedReplayBuffer))
         self.buffer.add(
-            observation_array,
+            model_observation,
             action_array,
             float(reward),
-            next_observation_array,
+            model_next_observation,
             bool(done),
         )
 
@@ -568,7 +592,7 @@ class ContinuousActorCriticAgent:
         return self._update_sac()
 
     def hidden_activations(self, observation: np.ndarray | torch.Tensor) -> np.ndarray:
-        obs = _as_numpy_vector(observation, name="observation")
+        obs = np.asarray(self._build_model_input(observation, advance=False), dtype=np.float32)
         tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.inference_mode():
             if hasattr(self.model, "encoder"):
@@ -581,10 +605,11 @@ class ContinuousActorCriticAgent:
     def reset_context(self) -> None:
         """Reset the temporal context history (call at episode boundaries)."""
         self._context_history = None
+        self._last_raw_observation = None
+        self._last_model_input = None
 
     def gate_weights(self, observation: np.ndarray | torch.Tensor) -> np.ndarray | None:
-        obs = _as_numpy_vector(observation, name="observation")
-        model_input = self._build_model_input(obs)
+        model_input = self._build_model_input(observation, advance=False)
         tensor = torch.as_tensor(model_input, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.inference_mode():
             outputs = self.model.forward(tensor)
@@ -683,6 +708,7 @@ class ContinuousActorCriticAgent:
             "algorithm": self.algorithm.value,
             "variant": self.variant,
             "observation_dim": self.observation_dim,
+            "model_observation_dim": self._model_observation_dim,
             "action_dim": self.action_dim,
             "use_temporal_context": self._use_temporal_context,
             "context_len": self._context_len,
